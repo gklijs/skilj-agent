@@ -1,0 +1,15 @@
+[package]
+name = "skilj-agent-checks"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+semver = "1.0.28"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+skilj-agent-index = { version = "0.1.0", path = "../index" }
+toml = "1.1.8"
+
+[dev-dependencies]
+toml = "1.1.8"

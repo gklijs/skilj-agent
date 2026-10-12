@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["crates/index", "crates/checks", "crates/cli"]
+
+# index  - reads a skilj project: bounded contexts, plugin types, tests (no model)
+# checks - turns the index into findings: testing, layout, version (no model)
+# cli    - the skilj-agent binary

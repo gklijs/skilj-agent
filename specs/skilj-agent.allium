@@ -1,0 +1,1249 @@
+-- allium: 3
+-- skilj-agent.allium
+
+-- Status: ELICITED, NOT YET BUILT. Written 2026-10-12 as the starting point
+--   of the project, then refined in two elicitation sessions the same day.
+--   Behaviour is decided; how each piece is built is not.
+--   No open questions left.
+--   See ../docs/design.md for the reasoning.
+--   Elicitation session 1 (2026-10-12) decided: interactive session,
+--   best-effort help plus a suggested issue for anything unsupported, an
+--   issue suggested for every failure, no project code in issues.
+--   Session 2 (same day) covered debugging, performance, skilj versions,
+--   issue filing, MCP (no), allium plan obligations, and closed most open
+--   questions. allium analyse reports no findings.
+
+-- Scope: An interactive command-line agent, built in Rust on rig, that helps a
+--   developer work on applications built on SkilJ. It can start a new
+--   SkilJ project or open an existing one, check whether the command,
+--   event and projection types are properly tested, write missing
+--   tests, keep the project ordered (one folder per bounded context),
+--   and help with performance and debugging.
+-- Design principle: everything that is the same for every SkilJ project
+--   is ordinary Rust code (finding types, mapping tests, moving files,
+--   looking up known errors, running cargo). The model is only asked for
+--   the parts that need judgement or new text, and every change it
+--   proposes is checked by the compiler and the test suite before the
+--   developer sees it. That keeps outcomes predictable and lets small
+--   local models (Ollama) do the work. Tasks are designed so a ~14B
+--   model (qwen3:14b) does them well; bigger models just do better.
+-- Purpose beyond one project: build collective knowledge about writing
+--   SkilJ applications with local models. Whatever the agent can't do,
+--   or does badly, becomes a suggested issue on the skilj-agent repo, so
+--   it can be turned into a hard-coded task or better reference text.
+--   That knowledge (reference texts, known errors, test patterns,
+--   prompts) lives in skilj-agent itself, seeded from the skilj skills.
+--   Only when an issue turns out to be a gap in SkilJ itself (a bug,
+--   missing docs) does the fix go to the skilj repo; the maintainer
+--   decides that when triaging, not the agent.
+-- Includes:
+--   - Opening a project and building an index of its bounded contexts
+--     and plugin types
+--   - Creating a new project from the skilj template
+--   - Test coverage findings, from code analysis and from an Allium spec
+--     when the project has one (allium plan)
+--   - Writing tests, verified by cargo before they are offered
+--   - Layout findings and the mechanical split into per-context folders
+--   - Diagnosing SkilJ errors and performance findings
+--   - Best-effort help with requests that aren't a known task
+--   - Suggesting issues on the skilj-agent repo for unsupported requests
+--     and failures
+--   - The deterministic commands (index, checks, lookup, replay, lag,
+--     load test) also run outside the session with JSON output, so other
+--     agents such as Claude Code can call them as a CLI, the way they use
+--     `allium check`. The reference texts are markdown, so they can also
+--     ship as a Claude Code skill.
+-- Excludes:
+--   - Editing SkilJ itself; the agent works on consuming applications
+--   - An MCP server (session 2 decision): the JSON CLI gives other
+--     agents the same value; an MCP server could later wrap it
+--   - Which model runs (Ollama, OpenAI-compatible, Anthropic, ...):
+--     configuration, modelled as the Model surface
+-- Dependencies: SkilJ (skilj.allium in the skilj repo) for what a
+--   bounded context, event, command and projection are. The allium CLI
+--   for reading a project's own spec.
+
+------------------------------------------------------------
+-- Actors and external entities
+------------------------------------------------------------
+
+external entity Developer {
+    name: String
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- How often the agent feeds compiler/test errors back to the model
+    -- before giving up on a proposal.
+    max_attempts: Integer = 3
+    -- A bounded context file longer than this is flagged as too big
+    -- (two of skilj-helpdesk's helpdesk files are above it).
+    max_context_file_lines: Integer = 800
+    -- The skilj version this release's knowledge is written for.
+    knowledge_skilj_version: String = "0.0.10"
+}
+
+------------------------------------------------------------
+-- Projects and the index
+------------------------------------------------------------
+
+-- Layout is personal preference, so all three styles are supported:
+--   by_kind:           src/<context>/{mod,events,commands,projections}.rs
+--   by_slice:          src/<context>/<command or projection>.rs, each with
+--                      its own tests, shared events in events.rs
+--   crate_per_context: crates/<context>/ in a workspace, plus an app crate
+-- The agent follows the project's style whenever it writes code or tests.
+entity Project {
+    path: String
+    status: opened | indexed | not_skilj
+    layout_style: unset | by_kind | by_slice | crate_per_context
+    -- What the index found closest, offered to the developer to confirm.
+    detected_style: by_kind | by_slice | crate_per_context | none
+    -- The skilj version the project depends on, compared with the one
+    -- this skilj-agent release's knowledge is written for.
+    skilj_version: String?
+    version_fit: unknown | same | older | newer
+
+    contexts: BoundedContext with project = this
+    findings: Finding with project = this
+    proposals: ChangeProposal with project = this
+
+    transitions status {
+        opened -> indexed
+        opened -> not_skilj
+        terminal: indexed, not_skilj
+    }
+}
+
+-- Found by looking for `pub const BOUNDED_CONTEXT: &str = "..."` and the
+-- `#[auto_register(BOUNDED_CONTEXT)]` impls that use it, and in projects
+-- using skilj-codegen, in `*.skilj.toml` files (bounded_context,
+-- event_type, command_type), whose decide() bodies stay in Rust.
+entity BoundedContext {
+    project: Project
+    name: String
+    files: Set<String>
+    line_count: Integer
+    layout: own_folder | single_file | shares_file
+
+    plugin_types: PluginType with context = this
+}
+
+entity PluginType {
+    context: BoundedContext
+    kind: event | command | projection | snapshot
+    name: String                     -- the type's NAME constant
+    file: String
+    -- Where its shape is declared. When the agent adds a type it follows
+    -- what the context already does: TOML for a codegen context, a Rust
+    -- impl otherwise. decide() and folds are always Rust.
+    declared_in: rust | skilj_toml
+    -- For commands: the `kind` strings of every Rejected branch in decide().
+    rejection_kinds: Set<String>
+    -- For projections: the event type names it consumes.
+    consumed_event_types: Set<String>
+}
+
+rule OpenProject {
+    when: OpenProject(by, path)
+    ensures: Project.created(path: path, status: opened, layout_style: unset, detected_style: none, skilj_version: null, version_fit: unknown)
+}
+
+-- Deterministic: cargo metadata plus a syn parse. No model involved.
+rule IndexProject {
+    when: project: Project.created
+    requires: project.status = opened
+    ensures:
+        if project_depends_on_skilj(project.path):
+            project.status = indexed
+            project.detected_style = closest_layout_style(project)
+            project.skilj_version = skilj_dependency_version(project)
+            project.version_fit = compare_version(project.skilj_version, config.knowledge_skilj_version)
+        else:
+            project.status = not_skilj
+}
+
+-- Deterministic: cargo generate on templates/skilj-template, then the
+-- wallet example context is renamed to the developer's first context.
+rule StartNewProject {
+    when: StartNewProject(by, path, first_context, style)
+    requires: style != unset
+    ensures: Project.created(path: path, status: opened, layout_style: style, detected_style: none, skilj_version: null, version_fit: unknown)
+}
+
+-- Changing the style of a project that already has one: every context
+-- that doesn't follow the new style gets an off_style finding (via
+-- CheckLayout), and each is restructured as its own proposal, so each
+-- is verified and applied separately.
+rule ChangeLayoutStyle {
+    when: ChangeLayoutStyle(by, project, style)
+    requires: project.layout_style != unset
+    requires: style != unset
+    requires: style != project.layout_style
+    ensures: project.layout_style = style
+    ensures: CheckLayout(by, project)
+}
+
+-- Older project: the agent warns and offers to upgrade skilj. Newer
+-- project: it warns and suggests updating skilj-agent. Either way it
+-- keeps working; issues from this project record the mismatch.
+rule VersionOlder {
+    when: project: Project.version_fit becomes older
+    ensures: Notice.created(project: project, text: "older skilj than this agent knows; upgrade offered")
+}
+
+rule VersionNewer {
+    when: project: Project.version_fit becomes newer
+    ensures: Notice.created(project: project, text: "newer skilj than this agent knows; update skilj-agent")
+}
+
+-- One version step at a time (0.0.7 -> 0.0.8, then -> 0.0.9, ...), so
+-- each proposal only carries that step's CHANGELOG.md entries, which
+-- suits a small model. Code bumps the dependency; the model adapts the
+-- code entry by entry. Verified like any other proposal. After one step
+-- is applied and the project is re-indexed, the next step is offered.
+rule UpgradeSkilj {
+    when: UpgradeSkilj(by, project)
+    requires: project.version_fit = older
+    ensures: ChangeProposal.created(
+        project: project,
+        for_finding: null,
+        for_investigation: null,
+        author: model,
+        status: drafted,
+        attempts: 0
+    )
+}
+
+-- A message shown in the session, nothing more.
+entity Notice {
+    project: Project
+    text: String
+}
+
+-- For an existing project, the agent asks once, offering the detected
+-- style (or none, e.g. skilj-helpdesk's one flat file per context). The
+-- answer is remembered for the project.
+rule ConfirmLayoutStyle {
+    when: ConfirmLayoutStyle(by, project, style)
+    requires: project.status = indexed
+    requires: style != unset
+    ensures: project.layout_style = style
+}
+
+------------------------------------------------------------
+-- Findings
+------------------------------------------------------------
+
+entity Finding {
+    project: Project
+    kind: untested | too_big | mixed_contexts | off_style | performance | known_error
+    subject: String                  -- type, context, obligation id or error
+    detail: String
+    status: open | addressed | dismissed
+
+    transitions status {
+        open -> addressed
+        open -> dismissed
+        terminal: addressed, dismissed
+    }
+}
+
+-- A thing that should have a test. Comes from two sources, both
+-- deterministic: the code index (each command's accepted path and each
+-- rejection kind, each projection fold) and, when the project has an
+-- Allium spec, the obligations `allium plan` derives from it.
+-- What "properly tested" means (elicitation session 1):
+--   command:    a unit test of decide() for the accepted path and for
+--               every rejection kind, plus one integration test that
+--               submits it through the running server (skilj-test-support)
+--   projection: a unit test of the fold for every consumed event type,
+--               plus one integration test that reads it back after a
+--               real command
+-- Unit tests are what the model writes most often, which suits a ~14B
+-- model; the integration test proves registration and the schema.
+entity TestObligation {
+    project: Project
+    obligation_id: String            -- e.g. "command.Withdraw.rejected.insufficient_funds" or "rule-success.Withdraw"
+    source: code_index | allium_spec
+    level: unit | integration | compiler
+    status: uncovered | covered
+}
+
+-- All deterministic. Then each obligation is matched against the
+-- project's tests (see CheckTesting).
+rule DeriveCommandObligations {
+    when: project: Project.status transitions_to indexed
+    for command in PluginTypes where context.project = project and kind = command:
+        ensures: TestObligation.created(
+            project: project,
+            obligation_id: obligation_id(command, "accepted"),
+            source: code_index,
+            level: unit,
+            status: uncovered
+        )
+        ensures: TestObligation.created(
+            project: project,
+            obligation_id: obligation_id(command, "integration"),
+            source: code_index,
+            level: integration,
+            status: uncovered
+        )
+}
+
+rule DeriveRejectionObligations {
+    when: project: Project.status transitions_to indexed
+    for command in PluginTypes where context.project = project and kind = command:
+        for rejection in command.rejection_kinds:
+            ensures: TestObligation.created(
+                project: project,
+                obligation_id: obligation_id(command, rejection),
+                source: code_index,
+                level: unit,
+                status: uncovered
+            )
+}
+
+rule DeriveProjectionObligations {
+    when: project: Project.status transitions_to indexed
+    for projection in PluginTypes where context.project = project and kind = projection:
+        ensures: TestObligation.created(
+            project: project,
+            obligation_id: obligation_id(projection, "integration"),
+            source: code_index,
+            level: integration,
+            status: uncovered
+        )
+        for event_type in projection.consumed_event_types:
+            ensures: TestObligation.created(
+                project: project,
+                obligation_id: obligation_id(projection, event_type),
+                source: code_index,
+                level: unit,
+                status: uncovered
+            )
+}
+
+-- When the project has Allium specs, the obligations `allium plan`
+-- derives are added too, matched by an `// allium: <id>` marker on a
+-- test. The level follows from the category, fixed in code:
+--   unit:        rule_success, rule_failure, transition_*, when_set,
+--                when_clear, when_presence, rule_entity_creation, derived
+--   integration: surface_actor, surface_provides, surface_exposure,
+--                temporal
+--   compiler:    entity_fields, entity_optional, enum_comparable,
+--                config_default, entity_relationship. Rust types and the
+--                registered JSON Schema already guarantee these, so they
+--                are covered from the start and never reported.
+rule DeriveSpecObligations {
+    when: project: Project.status transitions_to indexed
+    for planned in AlliumPlan.obligations(project):
+        ensures: TestObligation.created(
+            project: project,
+            obligation_id: planned.id,
+            source: allium_spec,
+            level: level_for_category(planned.category),
+            status: if level_for_category(planned.category) = compiler: covered else: uncovered
+        )
+}
+
+rule ObligationCovered {
+    when: TestFound(obligation)
+    requires: obligation.status = uncovered
+    ensures: obligation.status = covered
+}
+
+-- Deterministic: a test covers an obligation when it submits the command
+-- (or creates the event) and asserts on the outcome, or carries an
+-- `// allium: <obligation id>` marker. No model involved.
+rule CheckTesting {
+    when: CheckTesting(by, project)
+    requires: project.status = indexed
+    for obligation in TestObligations where project = project and status = uncovered:
+        ensures: Finding.created(
+            project: project,
+            kind: untested,
+            subject: obligation.obligation_id,
+            detail: "no test found",
+            status: open
+        )
+}
+
+-- No layout findings until the project has a style.
+rule CheckLayout {
+    when: CheckLayout(by, project)
+    requires: project.status = indexed
+    requires: project.layout_style != unset
+    for context in project.contexts where not follows_style(context, project.layout_style):
+        ensures: Finding.created(
+            project: project,
+            kind: off_style,
+            subject: context.name,
+            detail: "does not follow the project's layout style",
+            status: open
+        )
+    for context in project.contexts where layout = shares_file:
+        ensures: Finding.created(
+            project: project,
+            kind: mixed_contexts,
+            subject: context.name,
+            detail: "shares a file with another bounded context",
+            status: open
+        )
+    for context in project.contexts where line_count > config.max_context_file_lines:
+        ensures: Finding.created(
+            project: project,
+            kind: too_big,
+            subject: context.name,
+            detail: "split it up following the project's layout style",
+            status: open
+        )
+}
+
+------------------------------------------------------------
+-- Performance: always from measurements, always advice
+------------------------------------------------------------
+
+-- Performance changes are often design decisions (splitting a bounded
+-- context, changing tags, adding a snapshot), so the outcome is advice
+-- with the numbers behind it, never a change proposal. The model
+-- explains and prioritises; the measuring is code.
+entity PerformanceInvestigation {
+    project: Project
+    kind: slow | lag | load_test
+    subject: String?                 -- the slow command or query; null for lag and load tests
+    -- slow: traces from the project's tracing backend when one is
+    -- configured, otherwise a local reproduction (server with tracing at
+    -- debug, reading the command batcher's own debug events). A finding
+    -- from traces can be confirmed with a local reproduction.
+    -- lag: per async projection, the latest committed sequence minus its
+    -- caught_up_to, read from the event store (skilj has no lag metric).
+    -- load_test: a benchmark generated for the project's own commands,
+    -- payloads from their JSON schemas, in the scenarios of skilj's
+    -- command_throughput (spread and hot, several concurrency levels).
+    source: traces | local_run | event_store
+    status: measuring | measured | advised | unmeasurable
+
+    transitions status {
+        measuring -> measured
+        measuring -> unmeasurable
+        measured -> advised
+        terminal: advised, unmeasurable
+    }
+}
+
+rule InvestigateSlowness {
+    when: InvestigateSlowness(by, project, subject)
+    requires: project.status = indexed
+    ensures: PerformanceInvestigation.created(
+        project: project,
+        kind: slow,
+        subject: subject,
+        source: if tracing_backend_configured(project): traces else: local_run,
+        status: measuring
+    )
+}
+
+rule CheckProjectionLag {
+    when: CheckProjectionLag(by, project, store)
+    requires: project.status = indexed
+    ensures: PerformanceInvestigation.created(
+        project: project,
+        kind: lag,
+        subject: null,
+        source: event_store,
+        status: measuring
+    )
+}
+
+rule RunLoadTest {
+    when: RunLoadTest(by, project)
+    requires: project.status = indexed
+    ensures: PerformanceInvestigation.created(
+        project: project,
+        kind: load_test,
+        subject: null,
+        source: local_run,
+        status: measuring
+    )
+}
+
+rule MeasurementsTaken {
+    when: Measured(perf)
+    requires: perf.status = measuring
+    ensures: perf.status = measured
+}
+
+-- The advice is a Finding: where the time goes, the numbers, and the
+-- recommended change, citing skilj's performance docs where they apply.
+rule AdviceGiven {
+    when: perf: PerformanceInvestigation.status transitions_to measured
+    ensures: perf.status = advised
+    ensures: Finding.created(
+        project: perf.project,
+        kind: performance,
+        subject: perf.kind,
+        detail: "baseline measurements, where the time goes, recommended change",
+        status: open
+    )
+}
+
+-- Advice isn't a proposal, so the developer marks it addressed after
+-- making the change themselves.
+rule AdviceFollowed {
+    when: AdviceFollowed(by, finding)
+    requires: finding.kind = performance
+    requires: finding.status = open
+    ensures: finding.status = addressed
+}
+
+-- Offered once advice is followed: the same measurement again, shown
+-- next to the baseline kept in the finding.
+rule ReMeasure {
+    when: ReMeasure(by, finding, perf)
+    requires: finding.kind = performance
+    requires: finding.status = addressed
+    ensures: PerformanceInvestigation.created(
+        project: finding.project,
+        kind: perf.kind,
+        subject: perf.subject,
+        source: perf.source,
+        status: measuring
+    )
+}
+
+-- Couldn't measure: no tracing data for the subject and the local
+-- reproduction didn't show the slowness, or the generated load test
+-- didn't compile. Worth an issue: the agent should handle this case.
+rule MeasuringFailed {
+    when: MeasuringFailed(perf)
+    requires: perf.status = measuring
+    ensures: perf.status = unmeasurable
+    ensures: IssueSuggestion.created(
+        project: perf.project,
+        reason: gave_up,
+        summary: perf.kind,
+        target: undecided,
+        existing_issue: null,
+        status: searching
+    )
+}
+
+-- Lookup first: every skilj_core error variant has a known cause and fix
+-- (the skilj skill's common-mistakes.md, compiled into the binary). Only
+-- an error that isn't in the table goes to the model. Covers build
+-- errors, registration errors at startup and failing tests; for a
+-- failing test the proposal may change the code or the test.
+rule DiagnoseError {
+    when: DiagnoseError(by, project, error_output)
+    requires: project.status = indexed
+    ensures:
+        if is_known_skilj_error(error_output):
+            Finding.created(
+                project: project,
+                kind: known_error,
+                subject: error_output,
+                detail: "known cause and fix from the lookup table",
+                status: open
+            )
+        else:
+            ChangeProposal.created(
+                project: project,
+                for_finding: null,
+                for_investigation: null,
+                author: model,
+                status: drafted,
+                attempts: 0
+            )
+}
+
+------------------------------------------------------------
+-- Runtime debugging: unexpected decisions and wrong projections
+------------------------------------------------------------
+
+-- A connection to an event store, any environment, always read-only
+-- (the same access skilj-inspector uses).
+entity EventStore {
+    project: Project
+    location: String
+}
+
+rule ConnectEventStore {
+    when: ConnectEventStore(by, project, location)
+    requires: project.status = indexed
+    ensures: EventStore.created(project: project, location: location)
+}
+
+-- The developer reports that a command was decided differently than
+-- they expected, or that a projection shows the wrong state. Replaying
+-- is code: load the events matching the command's tags (or the events
+-- the projection consumed) and run decide() or the fold on them.
+entity Investigation {
+    project: Project
+    store: EventStore
+    kind: unexpected_decision | wrong_projection
+    subject: String                  -- command or projection name
+    recorded_outcome: String         -- what actually happened
+    expected_outcome: String?        -- what the developer expected
+    running_commit: String?          -- the code that ran, when it can be found
+    status: replaying | consistent | mismatch | reproducing | explained | fixing | closed
+
+    transitions status {
+        replaying -> consistent
+        replaying -> mismatch
+        consistent -> reproducing
+        consistent -> explained
+        mismatch -> explained
+        replaying -> explained
+        reproducing -> fixing
+        reproducing -> explained
+        fixing -> closed
+        explained -> closed
+        terminal: closed
+    }
+}
+
+rule StartInvestigation {
+    when: Investigate(by, project, store, kind, subject, recorded_outcome)
+    requires: project.status = indexed
+    ensures: Investigation.created(
+        project: project,
+        store: store,
+        kind: kind,
+        subject: subject,
+        recorded_outcome: recorded_outcome,
+        expected_outcome: null,
+        running_commit: null,
+        status: replaying
+    )
+}
+
+-- For a wrong projection the agent first checks whether it is simply
+-- behind (caught_up_to below the latest sequence). If it is, that's the
+-- answer, and a lag investigation follows. Only a caught-up projection
+-- is refolded.
+rule ProjectionIsBehind {
+    when: LagChecked(investigation, behind)
+    requires: investigation.kind = wrong_projection
+    requires: investigation.status = replaying
+    requires: behind
+    ensures: investigation.status = explained
+    ensures: PerformanceInvestigation.created(
+        project: investigation.project,
+        kind: lag,
+        subject: investigation.subject,
+        source: event_store,
+        status: measuring
+    )
+}
+
+-- The current code reaches the same outcome from the same events.
+-- The agent explains which events led there and asks which is right:
+-- the code, or the developer's expectation.
+rule ReplayConsistent {
+    when: Replayed(investigation, outcome)
+    requires: investigation.status = replaying
+    requires: outcome = investigation.recorded_outcome
+    ensures: investigation.status = consistent
+}
+
+-- The current code decides differently from what was recorded, so the
+-- code changed since. The agent looks for the commit that was running
+-- (event metadata, a deploy tag) and, if found, replays with that
+-- version to show what changed.
+rule ReplayMismatch {
+    when: Replayed(investigation, outcome)
+    requires: investigation.status = replaying
+    requires: outcome != investigation.recorded_outcome
+    ensures: investigation.status = mismatch
+    ensures: investigation.running_commit = find_running_commit(investigation)
+}
+
+rule MismatchExplained {
+    when: MismatchReported(investigation)
+    requires: investigation.status = mismatch
+    ensures: investigation.status = explained
+}
+
+rule ExpectationWasWrong {
+    when: CodeIsRight(by, investigation)
+    requires: investigation.status = consistent
+    ensures: investigation.status = explained
+}
+
+-- Code shrinks the events to the smallest set that still gives the
+-- recorded outcome, replaces the values with synthetic ones (tag values
+-- mapped consistently, so relations survive), and checks the result
+-- still reproduces. That set becomes the fixture of a test asserting the
+-- expected outcome.
+rule CodeWasWrong {
+    when: CodeIsWrong(by, investigation, expected_outcome)
+    requires: investigation.status = consistent
+    ensures: investigation.expected_outcome = expected_outcome
+    ensures: investigation.status = reproducing
+}
+
+rule FixtureReproduces {
+    when: FixtureBuilt(investigation, reproduces)
+    requires: investigation.status = reproducing
+    requires: reproduces
+    ensures: investigation.status = fixing
+    ensures: ChangeProposal.created(
+        project: investigation.project,
+        for_finding: null,
+        for_investigation: investigation,
+        author: model,
+        status: drafted,
+        attempts: 0
+    )
+}
+
+-- Minimising or anonymising lost the behaviour. The agent explains what
+-- it found without a test, and suggests an issue: the fixture builder
+-- should be able to handle this.
+rule FixtureDoesNotReproduce {
+    when: FixtureBuilt(investigation, reproduces)
+    requires: investigation.status = reproducing
+    requires: not reproduces
+    ensures: investigation.status = explained
+    ensures: IssueSuggestion.created(
+        project: investigation.project,
+        reason: gave_up,
+        summary: investigation.kind,
+        target: undecided,
+        existing_issue: null,
+        status: searching
+    )
+}
+
+rule InvestigationFixed {
+    when: proposal: ChangeProposal.status transitions_to applied
+    requires: proposal.for_investigation != null
+    requires: proposal.for_investigation.status = fixing
+    ensures: proposal.for_investigation.status = closed
+}
+
+rule CloseInvestigation {
+    when: CloseInvestigation(by, investigation)
+    requires: investigation.status in {explained, fixing}
+    ensures: investigation.status = closed
+}
+
+------------------------------------------------------------
+-- What survives between sessions
+------------------------------------------------------------
+
+-- Findings are recomputed every time a project is opened (deterministic
+-- and fast), so a dismissal has to be remembered or the finding comes
+-- back every session. Not-relevant dismissals are team decisions, like
+-- clippy's allow, and are stored in `.skilj-agent.toml` in the project,
+-- committed, together with the layout style.
+--
+-- Per user (~/.config/skilj-agent/): model and provider, forge login,
+-- EventStore connections (they hold credentials), queued issue
+-- suggestions.
+--
+-- Not stored at all: the index, obligations and findings (recomputed);
+-- proposals and investigations (tied to the current code, they last one
+-- session).
+entity Dismissal {
+    project: Project
+    kind: untested | too_big | mixed_contexts | off_style | performance | known_error
+    subject: String
+}
+
+rule DismissedStaysDismissed {
+    when: finding: Finding.created
+    requires: exists Dismissal{project: finding.project, kind: finding.kind, subject: finding.subject}
+    ensures: finding.status = dismissed
+}
+
+-- not_relevant: correct but you don't care (e.g. a context that is
+-- meant to stay in one file). wrong: the check itself is mistaken, e.g.
+-- flagged as untested while a test exists. Only wrong ones are a bug in
+-- the agent.
+rule DismissFinding {
+    when: DismissFinding(by, finding, reason)
+    requires: finding.status = open
+    ensures: finding.status = dismissed
+    ensures:
+        if reason = not_relevant:
+            Dismissal.created(project: finding.project, kind: finding.kind, subject: finding.subject)
+    ensures:
+        if reason = wrong:
+            IssueSuggestion.created(
+                project: finding.project,
+                reason: wrong_finding,
+                summary: finding.kind,
+                target: undecided,
+                existing_issue: null,
+                status: searching
+            )
+}
+
+------------------------------------------------------------
+-- Change proposals: the only way anything gets written
+------------------------------------------------------------
+
+entity ChangeProposal {
+    project: Project
+    for_finding: Finding?
+    -- Set for reproduce-then-fix proposals from a debugging investigation.
+    for_investigation: Investigation?
+    -- template: produced by code (layout split, new project). model: the
+    -- model wrote some or all of it for a known task (tests, fixes).
+    -- best_effort: the model worked on a request that isn't a known task,
+    -- with general tools; same verification, less predictable.
+    author: template | model | best_effort
+    status: drafted | verifying | verified | failed | applied | discarded
+    attempts: Integer
+
+    transitions status {
+        drafted -> verifying
+        verifying -> verified
+        verifying -> drafted
+        verifying -> failed
+        verified -> applied
+        verified -> discarded
+        failed -> discarded
+        terminal: applied, discarded
+    }
+}
+
+-- The model gets one obligation, the source of the type under test, the
+-- matching reference text (e.g. how to test a command) and an existing
+-- test from the same project as an example. Nothing else.
+rule WriteTest {
+    when: WriteTest(by, finding)
+    requires: finding.kind = untested
+    requires: finding.status = open
+    ensures: ChangeProposal.created(
+        project: finding.project,
+        for_finding: finding,
+        for_investigation: null,
+        author: model,
+        status: drafted,
+        attempts: 0
+    )
+}
+
+-- Mechanical, no model: move the context's types into the shape the
+-- project's layout style prescribes and fix module paths (and, for
+-- crate_per_context, Cargo manifests). Verified like any other proposal.
+rule RestructureContext {
+    when: RestructureContext(by, finding)
+    requires: finding.kind in {mixed_contexts, too_big, off_style}
+    requires: finding.project.layout_style != unset
+    requires: finding.status = open
+    ensures: ChangeProposal.created(
+        project: finding.project,
+        for_finding: finding,
+        for_investigation: null,
+        author: template,
+        status: drafted,
+        attempts: 0
+    )
+}
+
+-- Applied in a scratch copy (git worktree), then cargo check and the
+-- relevant tests run there. A proposal from an investigation is only
+-- verified when its reproducing test fails without the fix and passes
+-- with it.
+rule VerifyProposal {
+    when: proposal: ChangeProposal.status transitions_to drafted
+    ensures: proposal.status = verifying
+    ensures: proposal.attempts = proposal.attempts + 1
+}
+
+rule ProposalPasses {
+    when: ProposalChecked(proposal, passed)
+    requires: proposal.status = verifying
+    requires: passed
+    ensures: proposal.status = verified
+}
+
+-- Compiler and test output go back to the model, trimmed to the errors
+-- that touch the proposal.
+rule ProposalRetries {
+    when: ProposalChecked(proposal, passed)
+    requires: proposal.status = verifying
+    requires: not passed
+    requires: proposal.author in {model, best_effort}
+    requires: proposal.attempts < config.max_attempts
+    ensures: proposal.status = drafted
+}
+
+rule ProposalGivesUp {
+    when: ProposalChecked(proposal, passed)
+    requires: proposal.status = verifying
+    requires: not passed
+    requires: proposal.author = template or proposal.attempts >= config.max_attempts
+    ensures: proposal.status = failed
+}
+
+rule ApplyProposal {
+    when: ApplyProposal(by, proposal)
+    requires: proposal.status = verified
+    ensures: proposal.status = applied
+    ensures:
+        if proposal.for_finding != null:
+            proposal.for_finding.status = addressed
+}
+
+-- Discarding a proposal that passed verification means it was wrong in
+-- a way the compiler and tests couldn't see. The agent asks a one-line
+-- why and puts it in the suggested issue.
+rule DiscardVerifiedProposal {
+    when: DiscardProposal(by, proposal, why)
+    requires: proposal.status = verified
+    ensures: proposal.status = discarded
+    ensures: IssueSuggestion.created(
+        project: proposal.project,
+        reason: discarded,
+        summary: why,
+        target: undecided,
+        existing_issue: null,
+        status: searching
+    )
+}
+
+-- A failed proposal already suggested an issue when it gave up.
+rule DiscardFailedProposal {
+    when: DiscardProposal(by, proposal, why)
+    requires: proposal.status = failed
+    ensures: proposal.status = discarded
+}
+
+rule GivingUpSuggestsIssue {
+    when: proposal: ChangeProposal.status transitions_to failed
+    ensures: IssueSuggestion.created(
+        project: proposal.project,
+        reason: gave_up,
+        summary: proposal.author,
+        target: undecided,
+        existing_issue: null,
+        status: searching
+    )
+}
+
+------------------------------------------------------------
+-- Requests: free text in the session
+------------------------------------------------------------
+
+-- What the developer types in the session. The model only classifies it
+-- into one of the known tasks (structured output, fixed list); the task
+-- itself then runs as specified above.
+entity Request {
+    project: Project
+    text: String
+    status: received | ambiguous | matched | unsupported
+
+    transitions status {
+        received -> matched
+        received -> ambiguous
+        received -> unsupported
+        ambiguous -> matched
+        ambiguous -> unsupported
+        terminal: matched, unsupported
+    }
+}
+
+rule DeveloperAsks {
+    when: Ask(by, project, text)
+    ensures: Request.created(project: project, text: text, status: received)
+}
+
+rule RequestMatched {
+    when: RequestClassified(request, task, sure)
+    requires: request.status = received
+    requires: task != none
+    requires: sure
+    ensures: request.status = matched
+}
+
+-- Not sure which task is meant (e.g. "test CloseTicket": write a test, or
+-- check coverage?). The agent never guesses: it asks, offering the
+-- candidate tasks, and "none of these" leads to best effort.
+rule RequestAmbiguous {
+    when: RequestClassified(request, task, sure)
+    requires: request.status = received
+    requires: not sure
+    ensures: request.status = ambiguous
+}
+
+rule DeveloperPicksTask {
+    when: PickTask(by, request, task)
+    requires: request.status = ambiguous
+    ensures:
+        if task != none:
+            request.status = matched
+        else:
+            request.status = unsupported
+}
+
+-- Not a known task: try anyway, and always suggest an issue so it can
+-- become a proper task. The best-effort attempt still goes through
+-- verification and needs an explicit apply.
+rule RequestUnsupported {
+    when: RequestClassified(request, task, sure)
+    requires: request.status = received
+    requires: task = none
+    requires: sure
+    ensures: request.status = unsupported
+}
+
+-- Also reached when the developer answers "none of these" to an
+-- ambiguous request.
+rule BestEffortOnUnsupported {
+    when: request: Request.status transitions_to unsupported
+    ensures: ChangeProposal.created(
+        project: request.project,
+        for_finding: null,
+        for_investigation: null,
+        author: best_effort,
+        status: drafted,
+        attempts: 0
+    )
+    ensures: IssueSuggestion.created(
+        project: request.project,
+        reason: unsupported_request,
+        summary: request.text,
+        target: undecided,
+        existing_issue: null,
+        status: searching
+    )
+}
+
+------------------------------------------------------------
+-- Issue suggestions: how the agent gets better
+------------------------------------------------------------
+
+-- A drafted issue for the skilj-agent repo. Contains the request or
+-- failure, the skilj-agent / skilj / model versions and the outcome
+-- (did best effort work, what kind of change did it make), never the
+-- project's own code. The developer sees and can edit it before filing.
+entity IssueSuggestion {
+    project: Project
+    reason: unsupported_request | gave_up | discarded | wrong_finding
+    summary: String
+    -- Decided before the developer sees the suggestion: a new issue, or a
+    -- comment on an existing one that describes the same gap.
+    target: undecided | new_issue | comment_on_existing
+    existing_issue: String?
+    -- searching: looking for a matching issue. queued: the forge couldn't
+    -- be reached; kept locally (it holds no project code) and searched
+    -- again when it can be.
+    status: searching | queued | suggested | filed | declined
+
+    transitions status {
+        searching -> suggested
+        searching -> queued
+        queued -> searching
+        suggested -> filed
+        suggested -> declined
+        terminal: filed, declined
+    }
+}
+
+config {
+    -- How sure the match has to be before the agent comments on an
+    -- existing issue instead of opening a new one.
+    issue_match_confidence: Decimal = 0.8
+}
+
+-- Always search the skilj-agent repo's issues first (open and closed).
+-- A comment adds this occurrence's outcome and versions to the existing
+-- issue, so every occurrence makes that issue easier to fix. Matching is
+-- a black box (the model comparing the summary with the found issues).
+-- Searching works anonymously: the skilj-agent repo on GitHub is public.
+rule MatchExistingIssue {
+    when: IssueSearchDone(suggestion, found)
+    requires: suggestion.status = searching
+    ensures: suggestion.status = suggested
+    ensures:
+        if found != null and found.confidence >= config.issue_match_confidence:
+            suggestion.target = comment_on_existing
+            suggestion.existing_issue = found.issue
+        else:
+            suggestion.target = new_issue
+}
+
+rule ForgeUnreachable {
+    when: IssueSearchFailed(suggestion)
+    requires: suggestion.status = searching
+    ensures: suggestion.status = queued
+}
+
+-- At the start of a session, and whenever the forge is reachable again,
+-- queued suggestions are searched and offered again.
+rule RetryQueuedIssues {
+    when: ForgeReachable(project)
+    for suggestion in IssueSuggestions where project = project and status = queued:
+        ensures: suggestion.status = searching
+}
+
+-- Filing means opening the new issue or posting the comment, depending
+-- on target. Either way only after the developer approved the text.
+-- The repo and its issues live on GitHub (code may be mirrored to
+-- Codeberg, as skilj is; issues stay in one place so the duplicate search
+-- sees all of them). With a token, or an existing `gh` login, the agent
+-- posts through the API; otherwise it opens the pre-filled new-issue page
+-- in the browser (for a comment: the existing issue, with the text on the
+-- clipboard).
+rule FileIssue {
+    when: FileIssue(by, suggestion)
+    requires: suggestion.status = suggested
+    ensures: suggestion.status = filed
+}
+
+rule DeclineIssue {
+    when: DeclineIssue(by, suggestion)
+    requires: suggestion.status = suggested
+    ensures: suggestion.status = declined
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- An interactive session in a project. Free text goes through Ask; the
+-- known tasks are also available directly, without the model.
+surface Session {
+    facing developer: Developer
+
+    provides:
+        Ask(developer, project, text)
+        PickTask(developer, request, task)
+        OpenProject(developer, path)
+        StartNewProject(developer, path, first_context, style)
+        ConfirmLayoutStyle(developer, project, style)
+        UpgradeSkilj(developer, project)
+        ChangeLayoutStyle(developer, project, style)
+        AdviceFollowed(developer, finding)
+        ReMeasure(developer, finding, perf)
+        CheckTesting(developer, project)
+        CheckLayout(developer, project)
+        InvestigateSlowness(developer, project, subject)
+        CheckProjectionLag(developer, project, store)
+        RunLoadTest(developer, project)
+        DiagnoseError(developer, project, error_output)
+        ConnectEventStore(developer, project, location)
+        Investigate(developer, project, store, kind, subject, recorded_outcome)
+        CodeIsRight(developer, investigation)
+        CodeIsWrong(developer, investigation, expected_outcome)
+        CloseInvestigation(developer, investigation)
+        WriteTest(developer, finding)
+        RestructureContext(developer, finding)
+        DismissFinding(developer, finding, reason)
+        ApplyProposal(developer, proposal)
+        DiscardProposal(developer, proposal, why)
+        FileIssue(developer, suggestion)
+        DeclineIssue(developer, suggestion)
+
+    @guarantee NothingLeavesWithoutApproval
+        -- An issue is only filed after the developer has seen the full
+        -- text and said yes. Issues never contain project code.
+}
+
+surface ProjectReport {
+    facing developer: Developer
+    context project: Project
+
+    exposes:
+        for context in project.contexts:
+            context.name
+            context.layout
+            context.line_count
+        for finding in project.findings where status = open:
+            finding.kind
+            finding.subject
+            finding.detail
+}
+
+-- Integration surfaces: where results from the agent's own machinery
+-- come back in. All of it is deterministic code except Model.
+
+-- cargo in a scratch git worktree, plus the syn-based test matcher.
+surface Toolchain {
+    facing project: Project
+
+    provides:
+        ProposalChecked(proposal, passed)
+        TestFound(obligation)
+        FixtureBuilt(investigation, reproduces)
+}
+
+-- Read-only access to a connected EventStore; local runs for load tests
+-- and reproductions; the project's tracing backend when configured.
+surface Measurement {
+    facing project: Project
+
+    provides:
+        Replayed(investigation, outcome)
+        MismatchReported(investigation)
+        LagChecked(investigation, behind)
+        Measured(perf)
+        MeasuringFailed(perf)
+}
+
+-- The skilj-agent repo's forge: public search, posting with a token.
+surface Forge {
+    facing project: Project
+
+    provides:
+        IssueSearchDone(suggestion, found)
+        IssueSearchFailed(suggestion)
+        ForgeReachable(project)
+}
+
+-- The model is a black box behind this surface: Ollama by default, any
+-- rig provider by configuration. It only ever receives one narrow task
+-- with its context already selected, and answers in a fixed shape.
+surface Model {
+    facing project: Project
+
+    provides:
+        RequestClassified(request, task, sure)
+
+    @guarantee ModelNeverWritesDirectly
+        -- Model output only ever becomes a ChangeProposal. Nothing
+        -- reaches the developer's working tree without passing
+        -- VerifyProposal and an explicit ApplyProposal.
+
+    @guarantee ContextIsChosenByCode
+        -- Which files and reference texts the model sees is decided by
+        -- the task, not by the model browsing the project. Small local
+        -- models stay within their context window and on topic.
+
+    @guarantee LoadOnlyLocally
+        -- Load tests and local reproductions only ever write to a local
+        -- database the agent started itself, never to a connected
+        -- EventStore, which stays read-only.
+
+    @guarantee BestEffortToolsAreFixed
+        -- Best effort gets a fixed, small tool set, no more:
+        --   - read any file in the project folder
+        --   - write files, but only in the proposal's scratch worktree
+        --     (so ModelNeverWritesDirectly still holds)
+        --   - run cargo (build, test, metadata) in that worktree
+        --   - query a connected EventStore, read-only
+        --   - look up dependencies: cargo metadata, and the latest skilj
+        --     release
+        --   - search the example projects shipped as knowledge (skilj-demo,
+        --     the skilj template, ...)
+        -- A tool it would have needed but didn't have goes into the
+        -- suggested issue.
+
+    @guarantee EventDataIsGated
+        -- Event data from a store only reaches the model with
+        -- sensitive_fields masked. When the configured model is not
+        -- local, payloads are only sent after the developer confirms.
+}
+
+------------------------------------------------------------
+-- Open questions
+------------------------------------------------------------
+
