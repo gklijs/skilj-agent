@@ -34,7 +34,7 @@ pub(crate) fn parse(source: &str) -> anyhow::Result<Declaration> {
 }
 
 /// `WithdrawMoney` -> `decide_withdraw_money`.
-pub(crate) fn decide_fn_name(command: &str) -> String {
+pub fn decide_fn_name(command: &str) -> String {
     let mut out = String::from("decide");
     for c in command.chars() {
         if c.is_uppercase() {

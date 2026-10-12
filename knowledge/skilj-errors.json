@@ -1,0 +1,485 @@
+{
+  "skilj_version": "0.0.10",
+  "errors": [
+    {
+      "module": "access_control",
+      "variant": "RoleNotActive",
+      "code": "role_not_active",
+      "message": "this Role is not active"
+    },
+    {
+      "module": "access_control",
+      "variant": "GrantNotActive",
+      "code": "grant_not_active",
+      "message": "this RoleAccessMapping is not active"
+    },
+    {
+      "module": "access_control",
+      "variant": "InsufficientAccessLevel",
+      "code": "insufficient_access_level",
+      "message": "this grant's access level is too low for this action"
+    },
+    {
+      "module": "access_control",
+      "variant": "GrantBoundedContextMismatch",
+      "code": "grant_bounded_context_mismatch",
+      "message": "this RoleAccessMapping is scoped to a different bounded context"
+    },
+    {
+      "module": "access_control",
+      "variant": "GrantScopeMismatch",
+      "code": "grant_scope_mismatch",
+      "message": "this grant is scoped to a value that does not match this record's own owner"
+    },
+    {
+      "module": "access_control",
+      "variant": "NotOnRequiredTeam",
+      "code": "not_on_required_team",
+      "message": "this grant's Role is not on the team this projection requires to query it"
+    },
+    {
+      "module": "access_control",
+      "variant": "NotDefaultPrivateReader",
+      "code": "not_default_private_reader",
+      "message": "the caller is not this record's own default private reader"
+    },
+    {
+      "module": "access_control",
+      "variant": "NotGrantor",
+      "code": "not_grantor",
+      "message": "only the Role that made this PrivateFieldGrant may revoke it"
+    },
+    {
+      "module": "access_control",
+      "variant": "PrivateFieldGrantNotActive",
+      "code": "private_field_grant_not_active",
+      "message": "this PrivateFieldGrant is not active"
+    },
+    {
+      "module": "access_control",
+      "variant": "PrivateFieldRecordWrongBoundedContext",
+      "code": "private_field_record_wrong_bounded_context",
+      "message": "this record does not belong to the grantor's own bounded context"
+    },
+    {
+      "module": "access_control",
+      "variant": "TokenNotActive",
+      "code": "token_not_active",
+      "message": "this AccessToken is not active"
+    },
+    {
+      "module": "access_control",
+      "variant": "NotSuperadmin",
+      "code": "not_superadmin",
+      "message": "only an active superadmin Role may perform this action"
+    },
+    {
+      "module": "access_control",
+      "variant": "UnrecognisedSubject",
+      "code": "unrecognised_subject",
+      "message": "no active Role's external_subject matches this JWT's subject claim"
+    },
+    {
+      "module": "access_control",
+      "variant": "ExternalSubjectAlreadyClaimed",
+      "code": "external_subject_already_claimed",
+      "message": "this external_subject is already claimed by another active Role"
+    },
+    {
+      "module": "access_control",
+      "variant": "DuplicateActiveMapping",
+      "code": "duplicate_active_mapping",
+      "message": "this Role already holds an active RoleAccessMapping for this bounded context"
+    },
+    {
+      "module": "access_control",
+      "variant": "MalformedJwt",
+      "code": "malformed_jwt",
+      "message": "the presented JWT is malformed: {0}"
+    },
+    {
+      "module": "access_control",
+      "variant": "JwtMissingKeyId",
+      "code": "jwt_missing_key_id",
+      "message": "the presented JWT has no key id (kid) header, so no JWKS entry can verify it"
+    },
+    {
+      "module": "access_control",
+      "variant": "UnknownSigningKey",
+      "code": "unknown_signing_key",
+      "message": "the presented JWT's key id (kid) doesn't match any key in the trusted IdP's JWKS, even after a refetch"
+    },
+    {
+      "module": "access_control",
+      "variant": "JwtVerificationFailed",
+      "code": "jwt_verification_failed",
+      "message": "the presented JWT failed verification: {0}"
+    },
+    {
+      "module": "access_control",
+      "variant": "MissingSubjectClaim",
+      "code": "missing_subject_claim",
+      "message": "the presented JWT's verified claims have no {0} claim to trust as the subject"
+    },
+    {
+      "module": "access_control",
+      "variant": "JwksFetchFailed",
+      "code": "jwks_fetch_failed",
+      "message": "fetching the trusted IdP's JWKS failed: {0}"
+    },
+    {
+      "module": "access_control",
+      "variant": "StartAtSequenceMismatch",
+      "code": "start_at_sequence_mismatch",
+      "message": "start_from = at_sequence requires start_at_sequence and forbids start_at_time"
+    },
+    {
+      "module": "access_control",
+      "variant": "StartAtTimeMismatch",
+      "code": "start_at_time_mismatch",
+      "message": "start_from = at_time requires start_at_time and forbids start_at_sequence"
+    },
+    {
+      "module": "access_control",
+      "variant": "StartAtValueNotAllowed",
+      "code": "start_at_value_not_allowed",
+      "message": "start_from = beginning or latest forbids both start_at_sequence and start_at_time"
+    },
+    {
+      "module": "access_control",
+      "variant": "TokenScopeBeyondGrant",
+      "code": "token_scope_beyond_grant",
+      "message": "this admin grant is scoped, so a token it mints or revokes must have the same scope (a minted one may omit it to inherit that scope)"
+    },
+    {
+      "module": "event_store",
+      "variant": "BoundedContextArchived",
+      "code": "bounded_context_archived",
+      "message": "this bounded context is archived and accepts no new writes"
+    },
+    {
+      "module": "event_store",
+      "variant": "SchemaIncompatible",
+      "code": "schema_incompatible",
+      "message": "this schema change is not backwards compatible"
+    },
+    {
+      "module": "event_store",
+      "variant": "MissingScheduleOrPolicy",
+      "code": "missing_schedule_or_policy",
+      "message": "a scheduled EventType must declare both system_triggered_schedule and missed_occurrence_policy - neither has a default"
+    },
+    {
+      "module": "event_store",
+      "variant": "InvalidFilter",
+      "code": "invalid_filter",
+      "message": "this filter is invalid: its field's declared type doesn't support the operator, its value is longer than 4096 characters (an IS_LIKE pattern, 1024), or more than 32 filters were given"
+    },
+    {
+      "module": "event_store",
+      "variant": "TooManyTags",
+      "code": "too_many_tags",
+      "message": "at most 32 tags may be given in one query"
+    },
+    {
+      "module": "event_store",
+      "variant": "InvalidSchema",
+      "code": "invalid_schema",
+      "message": "this schema is not well-formed JSON Schema"
+    },
+    {
+      "module": "event_store",
+      "variant": "InvalidTagMapping",
+      "code": "invalid_tag_mapping",
+      "message": "this tag mapping names a field the schema doesn't declare"
+    },
+    {
+      "module": "event_store",
+      "variant": "InvalidOwnerTagKey",
+      "code": "invalid_owner_tag_key",
+      "message": "this owner_tag_key does not name a key present in tag_mappings"
+    },
+    {
+      "module": "event_store",
+      "variant": "SensitiveFieldTagOverlap",
+      "code": "sensitive_field_tag_overlap",
+      "message": "a TagMapping and a SensitiveField may not name the same field"
+    },
+    {
+      "module": "event_store",
+      "variant": "InvalidSensitiveField",
+      "code": "invalid_sensitive_field",
+      "message": "this sensitive field names a field the schema doesn't declare"
+    },
+    {
+      "module": "event_store",
+      "variant": "InvalidPrivateField",
+      "code": "invalid_private_field",
+      "message": "this private field names a field the schema doesn't declare, or its team/addressee_field presence doesn't match its kind"
+    },
+    {
+      "module": "event_store",
+      "variant": "PrivateFieldOverlap",
+      "code": "private_field_overlap",
+      "message": "a private field may not also be a tag mapping or a sensitive field"
+    },
+    {
+      "module": "event_store",
+      "variant": "TagMappingKeyDropped",
+      "code": "tag_mapping_key_dropped",
+      "message": "a re-registration may not drop a tag mapping key already in use"
+    },
+    {
+      "module": "event_store",
+      "variant": "EncryptionKeyNotActive",
+      "code": "encryption_key_not_active",
+      "message": "this EncryptionKey is not active"
+    },
+    {
+      "module": "event_store",
+      "variant": "EventTypeNotInBoundedContext",
+      "code": "event_type_not_in_bounded_context",
+      "message": "this named EventType belongs to a different bounded context than the grant's"
+    },
+    {
+      "module": "event_store",
+      "variant": "CommandTypeNotInBoundedContext",
+      "code": "command_type_not_in_bounded_context",
+      "message": "this named CommandType belongs to a different bounded context than the grant's"
+    },
+    {
+      "module": "event_store",
+      "variant": "TriggeredEventNotInBoundedContext",
+      "code": "triggered_event_not_in_bounded_context",
+      "message": "this triggered_event belongs to a different bounded context than the grant's"
+    },
+    {
+      "module": "event_store",
+      "variant": "AfterCommandNotInBoundedContext",
+      "code": "after_command_not_in_bounded_context",
+      "message": "this after_command belongs to a different bounded context than the grant's"
+    },
+    {
+      "module": "event_store",
+      "variant": "CursorAckModeMismatch",
+      "code": "cursor_ack_mode_mismatch",
+      "message": "this EventReadToken's cursor mode doesn't match what was requested"
+    },
+    {
+      "module": "event_store",
+      "variant": "NotManualAckCursor",
+      "code": "not_manual_ack_cursor",
+      "message": "acknowledging requires a manual_ack cursor"
+    },
+    {
+      "module": "event_store",
+      "variant": "EventReadNotAllowed",
+      "code": "event_read_not_allowed",
+      "message": "this EventType is not opted into event reads"
+    },
+    {
+      "module": "event_store",
+      "variant": "NoReadCursor",
+      "code": "no_read_cursor",
+      "message": "this EventReadToken has no read cursor yet - consume before acknowledging"
+    },
+    {
+      "module": "event_store",
+      "variant": "AcknowledgementRegresses",
+      "code": "acknowledgement_regresses",
+      "message": "an acknowledgement may not move a cursor backwards"
+    },
+    {
+      "module": "event_store",
+      "variant": "ExternalCreationNotAllowed",
+      "code": "external_creation_not_allowed",
+      "message": "this EventType is not opted into external event ingestion"
+    },
+    {
+      "module": "event_store",
+      "variant": "DirectCreationNotAllowed",
+      "code": "direct_creation_not_allowed",
+      "message": "this EventType is not opted into direct event creation"
+    },
+    {
+      "module": "event_store",
+      "variant": "RestTriggerNotAllowed",
+      "code": "rest_trigger_not_allowed",
+      "message": "this CommandType is not opted into REST triggering"
+    },
+    {
+      "module": "event_store",
+      "variant": "PayloadDoesNotMatchSchema",
+      "code": "payload_does_not_match_schema",
+      "message": "this payload does not validate against its type's registered schema"
+    },
+    {
+      "module": "event_store",
+      "variant": "ReservedIdempotencyKeyPrefix",
+      "code": "reserved_idempotency_key_prefix",
+      "message": "this idempotency key uses a reserved prefix - {RESERVED_IDEMPOTENCY_KEY_PREFIX:?} is reserved for skilj's own internal use"
+    },
+    {
+      "module": "event_store",
+      "variant": "IdempotencyKeyTooLong",
+      "code": "idempotency_key_too_long",
+      "message": "an idempotency key may be at most 255 characters"
+    },
+    {
+      "module": "event_store",
+      "variant": "DedupeAndIdempotencyKey",
+      "code": "dedupe_and_idempotency_key",
+      "message": "an external event takes either a dedupe cursor or an idempotency key, not both"
+    },
+    {
+      "module": "event_store",
+      "variant": "EpochChanged",
+      "code": "epoch_changed",
+      "message": "this position was read in database epoch {supplied}, but the database is now in epoch {current} (a failover or restore): events after an earlier point may be gone and their sequences reused - start again from a position read in the current epoch"
+    },
+    {
+      "module": "event_store",
+      "variant": "UnregisteredEventType",
+      "code": "unregistered_event_type",
+      "message": "decide() named an event type this bounded context has not registered: {0}"
+    },
+    {
+      "module": "event_store",
+      "variant": "PayloadDecodeFailed",
+      "code": "payload_decode_failed",
+      "message": "stored payload did not decode into its expected type: {0}"
+    },
+    {
+      "module": "event_store",
+      "variant": "CorrelationIdTooLong",
+      "code": "correlation_id_too_long",
+      "message": "correlation_id/causation_id must be at most {CORRELATION_ID_MAX_LEN} characters"
+    },
+    {
+      "module": "event_store",
+      "variant": "InvalidParkedDeliveryRequest",
+      "code": "invalid_parked_delivery_request",
+      "message": "parked delivery request does not match its kind's request shape: {0}"
+    },
+    {
+      "module": "event_store",
+      "variant": "SyncProjectionNotDeclared",
+      "code": "sync_projection_not_declared",
+      "message": "this instance does not declare sync projection {0:?}, which consumes this event type"
+    },
+    {
+      "module": "projections",
+      "variant": "ConsumedEventTypeNotInBoundedContext",
+      "code": "consumed_event_type_not_in_bounded_context",
+      "message": "a projection may only consume EventTypes from its own bounded context"
+    },
+    {
+      "module": "projections",
+      "variant": "DuplicateConsumedEventType",
+      "code": "duplicate_consumed_event_type",
+      "message": "consumedEventTypes names the EventType {0:?} more than once"
+    },
+    {
+      "module": "projections",
+      "variant": "NoProjectionRebuildStaged",
+      "code": "no_projection_rebuild_staged",
+      "message": "no pending ProjectionRebuild is staged for this projection"
+    },
+    {
+      "module": "projections",
+      "variant": "ProjectionCaughtUpTimedOut",
+      "code": "projection_caught_up_timed_out",
+      "message": "the projection did not catch up to the requested sequence within the configured wait"
+    },
+    {
+      "module": "bootstrap",
+      "variant": "SuperadminAlreadyExists",
+      "code": "superadmin_already_exists",
+      "message": "a superadmin Role already exists; the bootstrap secret can never be used again"
+    },
+    {
+      "module": "bootstrap",
+      "variant": "BootstrapSecretMismatch",
+      "code": "bootstrap_secret_mismatch",
+      "message": "the presented bootstrap secret doesn't match"
+    },
+    {
+      "module": "bootstrap",
+      "variant": "BoundedContextNameTaken",
+      "code": "bounded_context_name_taken",
+      "message": "a bounded context with this name already exists"
+    },
+    {
+      "module": "bootstrap",
+      "variant": "InvalidBoundedContextName",
+      "code": "invalid_bounded_context_name",
+      "message": "bounded context names must start with a lowercase letter, contain only lowercase letters, digits and underscores, and be at most 40 characters long"
+    },
+    {
+      "module": "bootstrap",
+      "variant": "CannotArchiveAdminContext",
+      "code": "cannot_archive_admin_context",
+      "message": "the admin bounded context can never be archived"
+    },
+    {
+      "module": "bootstrap",
+      "variant": "BoundedContextNotArchived",
+      "code": "bounded_context_not_archived",
+      "message": "a bounded context must be archived before it can be deleted"
+    },
+    {
+      "module": "bootstrap",
+      "variant": "CannotDeleteAdminContext",
+      "code": "cannot_delete_admin_context",
+      "message": "the admin bounded context can never be deleted"
+    },
+    {
+      "module": "bootstrap",
+      "variant": "ExternalSubjectAlreadyClaimed",
+      "code": "external_subject_already_claimed",
+      "message": "this external_subject is already bound to another active Role"
+    },
+    {
+      "module": "bootstrap",
+      "variant": "TemplateItselfTemplated",
+      "code": "template_itself_templated",
+      "message": "a BoundedContext used as a template must have no template of its own"
+    },
+    {
+      "module": "bootstrap",
+      "variant": "BoundedContextHasNoTemplate",
+      "code": "bounded_context_has_no_template",
+      "message": "this bounded context has no template to resync from"
+    },
+    {
+      "module": "encryption",
+      "variant": "MasterKeyNotConfigured",
+      "code": "encryption_master_key_not_configured",
+      "message": "sensitive_fields declares a field to encrypt, but no encryption_master_key was configured (SkiljBuilder::encryption_master_key)"
+    },
+    {
+      "module": "encryption",
+      "variant": "DecryptFailed",
+      "code": "encryption_decrypt_failed",
+      "message": "AEAD decryption failed - corrupted or tampered ciphertext, or the wrong key"
+    },
+    {
+      "module": "core",
+      "variant": "NoDeciderRegistered",
+      "code": "no_decider_registered",
+      "message": "this CommandType has no decide() registered in the running process"
+    },
+    {
+      "module": "core",
+      "variant": "Database",
+      "code": "database_error",
+      "message": "database error: {0}"
+    },
+    {
+      "module": "core",
+      "variant": "Migration",
+      "code": "migration_error",
+      "message": "migration error: {0}"
+    }
+  ]
+}

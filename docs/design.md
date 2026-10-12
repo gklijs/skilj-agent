@@ -47,7 +47,7 @@ skilj repo at build time.
 | Open project | `cargo metadata`; `syn` parse for `BOUNDED_CONTEXT` consts and `#[auto_register]` impls; rejection kinds from `decide()` | — |
 | New project | `cargo generate` on `templates/skilj-template`, rename the `wallet` context | maybe: suggest first events/commands from a description |
 | Is it tested? | obligations from the index + `allium plan` when the project has specs; match against tests | — |
-| Add tests | pick context, write file, `cargo test` in a git worktree, feed errors back (max 3) | write the test body |
+| Add tests | pick context, write file, `cargo test` in a scratch copy, feed errors back (max 3) | write the test body |
 | Ordering | detect the layout style (by kind, by slice, crate per context), flag contexts that don't follow it; restructure with `syn` + `prettyplease` | — |
 | Performance | fixed checks from skilj's `docs/performance.md` | explain, prioritise |
 | Debugging | error lookup table | anything not in the table |
@@ -66,7 +66,7 @@ Two things from your other projects fit well here:
 - **Structured output** through rig's `Extractor` (a JSON Schema per answer type) wherever the
   answer isn't code, so it never has to be parsed out of prose.
 - **Few tools per step.** If a step needs tools, two or three, not twenty.
-- **The compiler is the reviewer.** Every proposal is built and tested in a scratch git worktree
+- **The compiler is the reviewer.** Every proposal is built and tested in a scratch copy of the working tree
   before you see it.
 - **The provider is configuration.** rig has Ollama, OpenAI-compatible (also llama.cpp,
   LM Studio, vLLM) and Anthropic clients. Ollama is the default. `my-rig-agent` already talks to
@@ -82,7 +82,7 @@ skilj-agent/
     checks/             # testing / layout / performance / error lookup -> Findings
     refactor/           # mechanical changes (context split, new project)
     llm/                # rig wiring: provider config, prompts, extractors
-    verify/             # git worktree + cargo check/test loop
+    verify/             # scratch copy + cargo check/test loop
     cli/                # clap commands, the only binary
   references/           # skill text, include_str!'d
   specs/                # this spec
@@ -154,7 +154,7 @@ could call the same checks.
   `.skilj-agent.toml`; model, forge login, event store connections and queued issues are per user;
   findings are recomputed; proposals and investigations last one session.
 - **Unclear requests** are never guessed: the agent asks, offering the candidate tasks.
-- **Best effort** gets a fixed tool set: read project files, write only in the scratch worktree,
+- **Best effort** gets a fixed tool set: read project files, write only in the scratch copy,
   cargo, read-only event store queries, dependency and latest-skilj lookup, and searching the
   bundled example projects.
 
@@ -165,3 +165,46 @@ plugin types, rejection kinds followed through helpers, tests), derives the obli
 reports untested ones, layout and version. On skilj-helpdesk it finds every rejection kind in
 the source and none that aren't there. See the README for usage.
 
+`skilj-agent diagnose` is built: step 2. The error table is generated from the skilj 0.0.10
+source (80 error variants, each with its wire code and message); causes and fixes are recorded
+for 10 of them, from skilj's `common-mistakes.md`. The other 70 are recognised but have no
+recorded fix yet: the first candidates for the knowledge the issues should bring in.
+
+
+`skilj-agent write-test` is built: step 3. New crates: `verify` (scratch copy of the working
+tree, `cargo test`, errors sorted into the proposal's own and the project's), `llm` (rig, Ollama)
+and `tasks` (`write_test`). The scratch copy replaces the git worktree from the spec: a worktree
+checks out HEAD and would verify against code the developer no longer has.
+
+### First results with qwen3:14b on skilj-helpdesk (2026-10-12)
+
+| Obligation | Result |
+|---|---|
+| `command.RecordDailyActivity.rejected.already_recorded_today` | verified, attempt 1 (~75 s) |
+| `projection.CompanyEngagement.folds.DailyActivityRecorded` | verified, attempt 1 (~65 s) |
+| `command.AddInternalNote.rejected.snapshot_unreadable` | verified, attempt 2 |
+| `command.AssignTicket.rejected.ticket_not_open` | gave up |
+| `command.AutoAssignTicket.accepted` | gave up (before the latest context fixes) |
+| `command.ApplyMacro.rejected.requester_mismatch` | gave up (before the latest context fixes) |
+
+Plain `decide()`/`project()` work. Commands deciding from a snapshot (`decide_with`) are the hard
+case. What each round taught, all fixed except the last:
+
+- The code holding a rejection kind was missing when it sat in a method of another type
+  (`TicketFacts::reject_unless_requester`): context now follows methods of referenced types,
+  and always includes the code holding the kind's literal.
+- Same-named items from other contexts, binaries and unrelated types' methods crowded the
+  context: names now resolve to the type's own file first, then its bounded context.
+- The model forgot `use skilj_core::plugin::{Decision, SnapshotState}` (skilj doesn't re-export
+  them): added in code now.
+- A thinking model can reason without end: answers are capped at 8k tokens and 6 minutes.
+- **Open:** the model guesses a snapshot's `NAME` (`"ticket_snapshot"`), so `decide_with` finds
+  no snapshot and rejects with `snapshot_unreadable`. Fix: include the `impl Snapshot for X`
+  block (its `NAME` and `State`) when a snapshot type is referenced, and say in the task to use
+  `X::NAME`. Then rerun the three that gave up.
+
+Also worth considering:
+- skilj could re-export `Decision` and `SnapshotState` from `skilj`, like `CommandType`.
+- Answers grew to 4–6k tokens once the context grew past ~800 lines: worth measuring
+  `--no-think`, and trimming the event payloads a snapshot test doesn't need.
+- Issue suggestions are only printed for now; the forge part is still to build.

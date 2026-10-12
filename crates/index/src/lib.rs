@@ -9,12 +9,14 @@ mod cargo;
 mod codegen;
 mod facts;
 mod rust;
+pub mod source;
 
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub use cargo::not_a_skilj_project;
+pub use codegen::decide_fn_name;
 
 /// What `index()` found in one project.
 #[derive(Debug, Serialize)]

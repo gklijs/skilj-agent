@@ -4,6 +4,7 @@
 
 mod allium;
 pub mod config;
+pub mod diagnose;
 pub mod layout;
 mod obligations;
 
@@ -180,6 +181,12 @@ pub enum FindingKind {
     OffStyle,
     Performance,
     KnownError,
+}
+
+/// The obligations derived from the code alone: no `allium plan`, so
+/// cheap enough to rerun after every proposed change.
+pub fn code_obligations(index: &ProjectIndex) -> Vec<Obligation> {
+    obligations::from_code(index)
 }
 
 /// Runs every check on an indexed project.

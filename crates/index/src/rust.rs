@@ -213,14 +213,14 @@ fn str_lit(expr: &Expr) -> Option<String> {
     }
 }
 
-fn last_type_ident(ty: &syn::Type) -> Option<String> {
+pub(crate) fn last_type_ident(ty: &syn::Type) -> Option<String> {
     match ty {
         syn::Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
         _ => None,
     }
 }
 
-fn is_cfg_test(attrs: &[Attribute]) -> bool {
+pub(crate) fn is_cfg_test(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|a| {
         a.path().is_ident("cfg") && a.parse_args::<syn::Ident>().is_ok_and(|i| i == "test")
     })

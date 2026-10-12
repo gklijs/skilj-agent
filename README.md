@@ -6,7 +6,7 @@ a model only does the parts that need judgement or new text. See
 [`specs/skilj-agent.allium`](specs/skilj-agent.allium) for the behaviour and
 [`docs/design.md`](docs/design.md) for the reasoning.
 
-So far only the part without a model exists: `check`.
+`check` and `diagnose` use no model. `write-test` is the first command that does.
 
 ## `skilj-agent check`
 
@@ -65,12 +65,68 @@ kind = "too_big"
 subject = "src/helpdesk/ticket_commands.rs"
 ```
 
+## `skilj-agent diagnose`
+
+```sh
+cargo test 2>&1 | skilj-agent diagnose      # or: skilj-agent diagnose server.log
+skilj-agent diagnose server.log --json
+```
+
+Recognises skilj errors in any output (a failing test, server logs, a REST or GraphQL response)
+by their wire code (`invalid_tag_mapping`), their message, or their variant name
+(`EventStore(SchemaIncompatible)`), and shows the recorded cause and fix. An error without a
+recorded fix is still named, with skilj's own message. No model is involved.
+
+## `skilj-agent write-test`
+
+```sh
+skilj-agent write-test command.Withdraw.rejected.insufficient_funds --path ../my-app
+skilj-agent write-test projection.Balance.folds.Deposited --show-prompt   # what the model gets
+skilj-agent write-test ... --model qwen3:14b --transcript run.txt
+```
+
+Writes one unit test for one untested obligation from `check --all` (the accepted path or a
+rejection of a command, or a projection folding an event). Code decides everything around the
+test, and the model writes only the test function:
+
+- **What the model sees:** the type's own code and what it refers to, followed by name through the
+  package (an event enum only brings the payloads of the variants that are used), an existing
+  unit test from the project to imitate, and `knowledge/testing.md`.
+- **Where it goes:** the test module the example is in, else the file's first `#[cfg(test)]`
+  module, else a new one at the end of the file. For skilj-codegen types, the hand-written `.rs`
+  next to the `.skilj.toml`.
+- **How it's checked:** in a scratch copy of the project (the working tree, uncommitted changes
+  included, built in the project's own `target/` so dependencies aren't rebuilt):
+  1. the answer must be one `#[test]` function with a free name;
+  2. `check`'s own matching must count it as covering the obligation;
+  3. `cargo test` must compile and pass it.
+  What fails goes back to the model, three attempts in all.
+- **Your files** are only changed when you confirm, or with `--apply`, and only if the file hasn't
+  changed in the meantime.
+
+The model is `qwen3:14b` on Ollama by default (`--model`, `SKILJ_AGENT_MODEL`, `OLLAMA_HOST`),
+with a 16k context and at most 8k tokens and 6 minutes per answer. `--no-think` turns reasoning
+off: faster, usually worse.
+
+## Knowledge
+
+| File | What it is |
+|---|---|
+| `knowledge/skilj-errors.json` | Every skilj-core error variant with its code and message. Generated: `scripts/extract-skilj-errors.py ../skilj > knowledge/skilj-errors.json` |
+| `knowledge/testing.md` | How to unit test `decide()`, `decide_with()` and `project()`: what `write-test` gives the model. |
+| `knowledge/error-fixes.toml` | Causes and fixes, written by hand, seeded from skilj's `common-mistakes.md`. Add to it when an issue teaches a fix. |
+
+All are compiled into the binary. A test checks that every fix names a variant that exists.
+
 ## Layout
 
 | Crate | What it does |
 |---|---|
 | `crates/index` | Reads a project: contexts, plugin types, tests. No model. |
 | `crates/checks` | Turns the index into obligations and findings. No model. |
+| `crates/verify` | Scratch copies and `cargo test` runs, with errors sorted into the proposal's own and the project's. |
+| `crates/llm` | The model, through rig: Ollama for now. |
+| `crates/tasks` | Tasks that use a model: `write_test`. |
 | `crates/cli` | The `skilj-agent` binary. |
 
 `crates/checks/tests/fixtures/wallet` is a small project with known coverage, used by the

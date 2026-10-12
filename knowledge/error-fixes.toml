@@ -1,0 +1,72 @@
+# Causes and fixes for skilj errors, keyed by the variant names in
+# skilj-errors.json. Only what is documented; an error without an entry
+# here is still recognised, it just has no recorded fix yet.
+#
+# Source: skilj's .claude/skills/skilj/references/common-mistakes.md
+# (skilj 0.0.10). When a fix is learned from an issue, add it here.
+
+[[fix]]
+variant = "InvalidSchema"
+when = "registration"
+cause = "The derived JSON Schema of a Payload or State struct isn't well-formed."
+fix = "Check the struct derives schemars' JsonSchema and uses no type schemars can't represent."
+
+[[fix]]
+variant = "InvalidTagMapping"
+when = "registration"
+cause = "A TagMapping's field names something the Payload doesn't declare, or something that isn't a scalar or list-of-scalars leaf (a nested object, an array of objects, or more than one level of dotted nesting)."
+fix = "Check the field name against the Payload struct's own field names (typos are the usual cause), and that it's a leaf."
+
+[[fix]]
+variant = "InvalidSensitiveField"
+when = "registration"
+cause = "A SensitiveField's field or subject_field names something the Payload doesn't declare, or something that isn't a scalar or list-of-scalars leaf."
+fix = "Check the field name against the Payload struct's own field names (typos are the usual cause), and that it's a leaf."
+
+[[fix]]
+variant = "SensitiveFieldTagOverlap"
+when = "registration"
+cause = "The same field appears in both tag_mappings() and sensitive_fields() of one type."
+fix = "Tag the subject field instead, if you need both an indexed tag and an encrypted field for the same subject."
+
+[[fix]]
+variant = "SchemaIncompatible"
+when = "registration"
+cause = "Re-registering a type with a schema change that breaks existing readers: a field removed, tightened from optional to required, or retyped."
+fix = "Add new fields as Option<T>; never remove, narrow or retype one. A real reshape (rename, retype, split or merge) is not a schema revision: use a new type, a custom Deserialize, reshaping in Projection::project(), or skilj_core::plugin::upcast_payload (skilj docs/architecture.md §33). Not this error: an older version starting after a newer one registered the type; startup keeps the newer registration (ReconciliationReport::kept_newer)."
+
+[[fix]]
+variant = "TagMappingKeyDropped"
+when = "registration"
+cause = "Re-registering with tag_mappings() that drop a key an earlier registration already used. A live tag key can't be un-mapped."
+fix = "Keep the key. To stop tagging that field, introduce a new type."
+
+[[fix]]
+variant = "MissingScheduleOrPolicy"
+when = "registration"
+cause = "EventType::system_triggered_allowed() returns true, but system_triggered_schedule() and missed_occurrence_policy() aren't both overridden."
+fix = "Override both; neither has a default."
+
+[[fix]]
+variant = "PayloadDoesNotMatchSchema"
+when = "submission"
+cause = "The JSON payload of a command submission, or of a direct or external event creation, doesn't validate against the registered schema."
+fix = "If the payload looks right, check the schema that is actually registered: schemars renders Option<T> as a type array ([\"string\",\"null\"]) and enums through $ref, even plain unit enums."
+
+[[fix]]
+variant = "UnregisteredEventType"
+when = "submission"
+cause = "decide() returned an EventSpec (or a projection's consumed_event_types() named an event type) that isn't a registered EventType::NAME in this bounded context."
+fix = "Usually a typo, or an event type used in decide() but never given its own #[auto_register(BOUNDED_CONTEXT)] impl EventType block."
+
+[[fix]]
+variant = "NoDeciderRegistered"
+when = "submission"
+cause = "The command type is registered in the database, but the running process never registered a Rust impl CommandType for it, so there is no decide() to call."
+fix = "The binary serving requests is missing an #[auto_register] type (or a .command_type::<T>() call) that another binary registered. Check you're editing the binary that is actually running."
+
+# Not an error, but output worth recognising.
+[[pitfall]]
+matches = "skipped_no_access"
+cause = "A bounded context whose access was never granted to the reconciliation_role registers nothing, silently, on every deploy."
+fix = "Check report.skipped_no_access (returned from .build()) instead of assuming Ok means everything registered."
