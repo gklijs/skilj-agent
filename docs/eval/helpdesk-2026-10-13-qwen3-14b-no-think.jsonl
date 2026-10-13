@@ -1,0 +1,7 @@
+{"obligation": "command.RecordDailyActivity.rejected.already_recorded_today", "outcome": "verified", "attempts": 1, "seconds": 24, "problem": null, "no_think": true}
+{"obligation": "projection.CompanyEngagement.folds.DailyActivityRecorded", "outcome": "verified", "attempts": 1, "seconds": 15, "problem": null, "no_think": true}
+{"obligation": "command.AddInternalNote.rejected.snapshot_unreadable", "outcome": "verified", "attempts": 1, "seconds": 18, "problem": null, "no_think": true}
+{"obligation": "command.AssignTicket.rejected.ticket_not_open", "outcome": "verified", "attempts": 1, "seconds": 20, "problem": null, "no_think": true}
+{"obligation": "command.AutoAssignTicket.accepted", "outcome": "gave_up", "attempts": 3, "seconds": 69, "problem": "doesn't compile (1 error): error[E0308]: mismatched types", "no_think": true}
+{"obligation": "command.ApplyMacro.rejected.ticket_not_in_progress", "outcome": "gave_up_maybe_unreachable", "attempts": 3, "seconds": 62, "problem": "the test fails: thread 'helpdesk::macros::tests::applying_a_macro_to_a_ticket_not_in_progress_is_rejected' (103037) panicked at src/helpdesk/macros.rs:661:18:", "no_think": true}
+{"obligation": "command.ApplyMacro.rejected.requester_mismatch", "outcome": "gave_up_maybe_unreachable", "attempts": 3, "seconds": 74, "problem": "the test fails: thread 'helpdesk::macros::tests::applying_a_macro_with_wrong_requester_id_rejects_with_requester_mismatch' (106075) panicked at src/helpdesk/macros.rs:664:18:", "no_think": true}

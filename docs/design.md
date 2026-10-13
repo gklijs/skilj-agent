@@ -183,12 +183,13 @@ checks out HEAD and would verify against code the developer no longer has.
 | `command.RecordDailyActivity.rejected.already_recorded_today` | verified, attempt 1 (~75 s) |
 | `projection.CompanyEngagement.folds.DailyActivityRecorded` | verified, attempt 1 (~65 s) |
 | `command.AddInternalNote.rejected.snapshot_unreadable` | verified, attempt 2 |
-| `command.AssignTicket.rejected.ticket_not_open` | gave up |
-| `command.AutoAssignTicket.accepted` | gave up (before the latest context fixes) |
-| `command.ApplyMacro.rejected.requester_mismatch` | gave up (before the latest context fixes) |
+| `command.AssignTicket.rejected.ticket_not_open` | verified, attempt 1 (~75 s) |
+| `command.AutoAssignTicket.accepted` | verified (~2 min), both snapshots built right |
+| `command.ApplyMacro.rejected.requester_mismatch` | gave up: the obligation is unreachable (below) |
+| `command.ApplyMacro.rejected.ticket_not_in_progress` | verified, attempt 2 (~4.5 min): inherited, reached through the "comes from `ResolveTicket::decide_on`" hint |
 
-Plain `decide()`/`project()` work. Commands deciding from a snapshot (`decide_with`) are the hard
-case. What each round taught, all fixed except the last:
+Plain `decide()`/`project()` work, and so does `decide_with` once the model is told the
+snapshot's `NAME`. What each round taught:
 
 - The code holding a rejection kind was missing when it sat in a method of another type
   (`TicketFacts::reject_unless_requester`): context now follows methods of referenced types,
@@ -198,13 +199,51 @@ case. What each round taught, all fixed except the last:
 - The model forgot `use skilj_core::plugin::{Decision, SnapshotState}` (skilj doesn't re-export
   them): added in code now.
 - A thinking model can reason without end: answers are capped at 8k tokens and 6 minutes.
-- **Open:** the model guesses a snapshot's `NAME` (`"ticket_snapshot"`), so `decide_with` finds
-  no snapshot and rejects with `snapshot_unreadable`. Fix: include the `impl Snapshot for X`
-  block (its `NAME` and `State`) when a snapshot type is referenced, and say in the task to use
-  `X::NAME`. Then rerun the three that gave up.
+- The model guessed a snapshot's `NAME` (`"ticket_snapshot"`), so `decide_with` found no
+  snapshot and rejected with `snapshot_unreadable`. Now a shown snapshot type brings its
+  `impl Snapshot for X`, and the task gives the `NAME` as a string literal (`X::NAME` needs the
+  `Snapshot` trait in scope, which the test module may not have).
+- `ApplyMacro.rejected.requester_mismatch` was a false obligation. `ApplyMacro` reaches
+  `TicketFacts::reject_unless_requester` only through `RequestInfoFromCustomer::decide_on`, and
+  passes the ticket's own `requester_id`, so it never rejects. The index sees calls, not
+  arguments, and data flow isn't worth it. Instead:
+  - the index records kinds reached only through another command's method (`inherited_kinds`),
+    and `check` says "only reached through X, so it may be unreachable from here". Not all are
+    false: `ApplyMacro`'s `ticket_not_in_progress` (via `ResolveTicket::decide_on`) is real;
+  - the task tells the model which call the kind comes from;
+  - when write-test gives up on an inherited kind, or every test that ran was rejected with
+    another of the command's kinds, it says the rejection may be unreachable and prints the
+    `[[dismissed]]` entry to add, now with a `reason`. Dismissed obligations are refused.
+  - For skilj-helpdesk itself: splitting `RequestInfoFromCustomer::decide_on` into the
+    requester check and the rest would make `ApplyMacro`'s code, and so the index, honest.
+
+`--no-think` on the same seven (2026-10-13): 4 verified on attempt 1 in 15–24 s, against 65 s
+to 4.5 min with thinking. It gave up on `AutoAssignTicket.accepted` (two snapshots) and the
+inherited `ApplyMacro.rejected.ticket_not_in_progress`, both verified with thinking. So: thinking
+for anything that needs reasoning across calls; `--no-think` may do as a fast first try, with
+thinking only for what it gives up on.
+
+### Every untested unit obligation of skilj-helpdesk, qwen3:14b with thinking (2026-10-13)
+
+`scripts/eval-write-test.py ../skilj-helpdesk full.jsonl`, with the snapshot and inherited-kind
+fixes: **154 of 155 verified**, in 2.8 hours (median 53 s per obligation). Per obligation in
+[`eval/helpdesk-2026-10-13-qwen3-14b.jsonl`](eval/helpdesk-2026-10-13-qwen3-14b.jsonl).
+
+| Obligations | Verified |
+|---|---|
+| 81 command rejections | 80; the other is the unreachable `ApplyMacro.rejected.requester_mismatch`, which got the hint |
+| 33 command accepted paths | 33 |
+| 41 projection folds | 41 |
+
+131 on attempt 1, 16 on attempt 2, 7 on attempt 3 (mostly `ApplyMacro`'s and other snapshot
+commands' accepted paths). A scan of the verified tests found none that only mention the kind
+without asserting it; read by hand, they build realistic input and assert on event types and
+payloads or on the folded state. None were added to skilj-helpdesk.
 
 Also worth considering:
 - skilj could re-export `Decision` and `SnapshotState` from `skilj`, like `CommandType`.
-- Answers grew to 4–6k tokens once the context grew past ~800 lines: worth measuring
-  `--no-think`, and trimming the event payloads a snapshot test doesn't need.
-- Issue suggestions are only printed for now; the forge part is still to build.
+- Answers grew to 4–6k tokens once the context grew past ~800 lines: worth trimming the event
+  payloads a snapshot test doesn't need, and trying `--no-think` first (above).
+- Issue suggestions are matched by a key line in the issue body rather than by the model:
+  deterministic, and good enough while the agent itself makes every suggestion. A free-text
+  request (the future `ask`) will need the model's comparison the spec describes.

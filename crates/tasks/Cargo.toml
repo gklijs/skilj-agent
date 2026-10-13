@@ -10,3 +10,6 @@ skilj-agent-index = { version = "0.1.0", path = "../index" }
 skilj-agent-llm = { version = "0.1.0", path = "../llm" }
 skilj-agent-verify = { version = "0.1.0", path = "../verify" }
 syn = { version = "2", features = ["full", "printing"] }
+
+[dev-dependencies]
+toml = "1.1.8"

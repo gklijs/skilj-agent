@@ -2,9 +2,12 @@
 //! and `diagnose` use no model; `write-test` asks one for a single test
 //! and verifies it before showing it.
 
+mod issue;
+
 use clap::{Parser, Subcommand};
 use skilj_agent_checks::diagnose::{Diagnosis, Knowledge, MatchedBy};
-use skilj_agent_llm::ModelConfig;
+use skilj_agent_issues::{Occurrence, Suggestion};
+use skilj_agent_llm::{ModelConfig, Thinking};
 use skilj_agent_tasks::write_test::{self, Progress, RunOutcome};
 use skilj_agent_checks::{
     FindingKind, Level, ProjectConfig, Report, Source, VersionFit, config, layout,
@@ -65,8 +68,13 @@ enum Command {
         /// The Ollama model [env: SKILJ_AGENT_MODEL; default: qwen3:14b].
         #[arg(long)]
         model: Option<String>,
-        /// Answer without reasoning first: faster, usually worse.
-        #[arg(long)]
+        /// When the model reasons before answering. `fallback`: the first
+        /// attempt without (fast, enough for simple cases), every retry
+        /// with.
+        #[arg(long, value_enum, default_value_t = ThinkingArg::Fallback)]
+        thinking: ThinkingArg,
+        /// Short for `--thinking never`.
+        #[arg(long, conflicts_with = "thinking")]
         no_think: bool,
         /// Add the verified test to the project without asking.
         #[arg(long)]
@@ -79,6 +87,29 @@ enum Command {
         #[arg(long)]
         transcript: Option<PathBuf>,
     },
+    /// Offer the suggested issues on skilj-agent that are still waiting.
+    ///
+    /// Each failure of the agent suggests an issue, so what it can't do yet
+    /// becomes knowledge it ships. Nothing is posted without your yes, and
+    /// a suggestion never holds your project's code.
+    Issues,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ThinkingArg {
+    Always,
+    Never,
+    Fallback,
+}
+
+impl From<ThinkingArg> for Thinking {
+    fn from(t: ThinkingArg) -> Self {
+        match t {
+            ThinkingArg::Always => Thinking::Always,
+            ThinkingArg::Never => Thinking::Never,
+            ThinkingArg::Fallback => Thinking::Fallback,
+        }
+    }
 }
 
 /// `writeln!` into the report; writing to a String can't fail.
@@ -94,14 +125,15 @@ fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Check { path, json, all } => run_check(&path, json, all),
         Command::Diagnose { file, json } => run_diagnose(file.as_deref(), json),
-        Command::WriteTest { obligation, path, model, no_think, apply, show_prompt, transcript } => {
+        Command::WriteTest { obligation, path, model, thinking, no_think, apply, show_prompt, transcript } => {
             let mut config = ModelConfig::from_env();
             if let Some(model) = model {
                 config.model = model;
             }
-            config.think = !no_think;
+            config.thinking = if no_think { Thinking::Never } else { thinking.into() };
             run_write_test(&path, &obligation, &config, apply, show_prompt, transcript.as_deref())
         }
+        Command::Issues => issue::run_pending(),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -135,10 +167,53 @@ fn run_diagnose(file: Option<&Path>, json: bool) -> anyhow::Result<()> {
     };
     let diagnosis = skilj_agent_checks::diagnose::diagnose(&Knowledge::bundled(), &output);
     if json {
-        print(serde_json::to_string_pretty(&diagnosis)?)
-    } else {
-        print(render_diagnosis(&diagnosis))
+        return print(serde_json::to_string_pretty(&diagnosis)?);
     }
+    print(render_diagnosis(&diagnosis))?;
+    for suggestion in diagnosis_suggestions(&diagnosis, &output) {
+        issue::suggest(suggestion)?;
+    }
+    Ok(())
+}
+
+/// What `diagnose` couldn't help with: unrecognised output that mentions
+/// skilj, and errors without a recorded fix. Only skilj's own error codes
+/// go in.
+fn diagnosis_suggestions(d: &Diagnosis, output: &str) -> Vec<Suggestion> {
+    let occurrence = Occurrence {
+        outcome: Some(format!("knowledge of skilj {}", d.knowledge_skilj_version)),
+        ..Default::default()
+    };
+    if d.recognised.is_empty() {
+        if !output.to_lowercase().contains("skilj") {
+            return Vec::new();
+        }
+        return vec![Suggestion::new(
+            "diagnose/unrecognised",
+            "diagnose: skilj output it doesn't recognise",
+            "diagnose recognised no skilj error in output that did come from skilj.\n\n\
+             The error's code or message, without anything from your project: <add it here>",
+            occurrence,
+        )];
+    }
+    let mut out: Vec<Suggestion> = Vec::new();
+    for r in &d.recognised {
+        if let (None, Some(e)) = (&r.fix, &r.error)
+            && !out.iter().any(|s| s.key.ends_with(&format!("/{}", e.code)))
+        {
+            out.push(Suggestion::new(
+                format!("diagnose/no-fix/{}", e.code),
+                format!("diagnose: no cause or fix for skilj's `{}`", e.code),
+                format!(
+                    "skilj's {} error `{}` ({}) has no recorded cause or fix in knowledge/error-fixes.toml yet.\n\n\
+                     What caused it and what fixed it, if you know: <add it here>",
+                    e.module, e.code, e.variant
+                ),
+                occurrence.clone(),
+            ));
+        }
+    }
+    out
 }
 
 fn run_write_test(
@@ -150,7 +225,14 @@ fn run_write_test(
     transcript: Option<&Path>,
 ) -> anyhow::Result<()> {
     let index = skilj_agent_index::index(path)?;
-    let plan = write_test::plan(&index, obligation)?;
+    let project_config = ProjectConfig::load(&index.root)?;
+    let plan = write_test::plan(&index, &project_config, obligation)?;
+    let kind = obligation.split('.').next().unwrap_or("unit");
+    let occurrence = |outcome: String| Occurrence {
+        skilj: index.skilj_version.clone(),
+        model: Some(format!("{}, {}", config.model, config.thinking.describe())),
+        outcome: Some(outcome),
+    };
     if show_prompt {
         return print(format!(
             "--- system ---\n{}\n--- task ---\n{}",
@@ -168,7 +250,7 @@ fn run_write_test(
             write_test::Placement::NewModule { name } => format!("a new mod {name} in {}", plan.file),
         }
     );
-    eprintln!("model: {}{}", config.describe(), if config.think { "" } else { ", without thinking" });
+    eprintln!("model: {}, {}", config.describe(), config.thinking.describe());
 
     let mut log = String::new();
     if transcript.is_some() {
@@ -176,11 +258,15 @@ fn run_write_test(
     }
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let outcome = runtime.block_on(write_test::run(&index, &plan, config, |p| match p {
-        Progress::Asking { attempt, message } => {
+        Progress::Asking { attempt, think, message } => {
             if transcript.is_some() {
-                line!(log, "=== attempt {attempt}: to the model\n{message}");
+                line!(log, "=== attempt {attempt} ({}): to the model\n{message}", if think { "thinking" } else { "not thinking" });
             }
-            eprint!("attempt {attempt}/{}: asking the model... ", write_test::MAX_ATTEMPTS)
+            eprint!(
+                "attempt {attempt}/{}: asking the model{}... ",
+                write_test::attempts(config.thinking),
+                if think { "" } else { ", without thinking" }
+            )
         }
         Progress::Answered { reply, .. } => {
             if transcript.is_some() {
@@ -218,21 +304,61 @@ fn run_write_test(
             if apply || confirm("Add it to your project?")? {
                 proposal.apply(&index.root)?;
                 eprintln!("Added {} to {}.", proposal.test_name, proposal.file);
-            } else {
-                eprintln!("Not added. If it is wrong in a way the compiler couldn't see, that is worth an issue on skilj-agent.");
+                return Ok(());
+            }
+            eprintln!("Not added.");
+            // Discarding a verified test means it is wrong in a way the
+            // compiler couldn't see (spec: DiscardVerifiedProposal).
+            if let Some(why) = ask_line("What's wrong with it? One line, or Enter to skip:")? {
+                issue::suggest(Suggestion::new(
+                    format!("write-test/discarded/{kind}"),
+                    format!("write-test: verified {kind} tests that are wrong"),
+                    format!(
+                        "write-test proposed a {kind} test that compiled, passed and covered the obligation, but was \
+                         wrong. In the developer's words:\n\n> {why}"
+                    ),
+                    occurrence(format!("verified after {} attempts", proposal.attempts)),
+                ))?;
             }
             Ok(())
         }
-        RunOutcome::GaveUp { attempts, last } => {
+        RunOutcome::GaveUp { attempts, last, unreachable } => {
             eprintln!();
             eprintln!("Gave up after {attempts} attempts; the last one: {}", last.summary());
-            eprintln!(
-                "Worth an issue on skilj-agent (without your code): write-test, a {} obligation, {}: {}.",
-                obligation.split('.').next().unwrap_or("unit"),
-                config.model,
-                last.category()
-            );
-            Ok(())
+            let outcome = occurrence(format!("gave up after {attempts} attempts"));
+            let suggestion = match &unreachable {
+                Some(hint) => {
+                    eprintln!();
+                    eprintln!("{hint}");
+                    if plan.via.is_empty() {
+                        Suggestion::new(
+                            format!("write-test/gave-up/{kind}/rejected-earlier"),
+                            "write-test: every test for a rejection was rejected earlier",
+                            "write-test gave up on a rejection: every test that ran was rejected with another of \
+                             the command's kinds. The rejection may be unreachable, or the model couldn't find input \
+                             that gets past the earlier checks.",
+                            outcome,
+                        )
+                    } else {
+                        Suggestion::new(
+                            "check/inherited-rejection-may-be-unreachable",
+                            "check: a rejection reached only through another command's logic may be unreachable",
+                            "check counted a rejection kind that a command only reaches by calling another \
+                             command's logic (`Other::decide_on`), and write-test couldn't make the command reject \
+                             with it. The calling command may pass arguments that rule it out, which the index \
+                             can't see.",
+                            outcome,
+                        )
+                    }
+                }
+                None => Suggestion::new(
+                    format!("write-test/gave-up/{kind}/{}", last.category().replace(' ', "-")),
+                    format!("write-test gives up on {kind} obligations: {}", last.category()),
+                    format!("write-test gave up on a {kind} obligation; the last problem: {}.", last.category()),
+                    outcome,
+                ),
+            };
+            issue::suggest(suggestion)
         }
         RunOutcome::ProjectBroken(errors) => {
             eprintln!();
@@ -244,6 +370,19 @@ fn run_write_test(
 }
 
 /// Asks on a terminal; anything but yes, or no terminal, is no.
+/// A line typed in answer, when there is a terminal and it isn't empty.
+fn ask_line(question: &str) -> anyhow::Result<Option<String>> {
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    eprint!("{question} ");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let answer = answer.trim();
+    Ok((!answer.is_empty()).then(|| answer.to_string()))
+}
+
 fn confirm(question: &str) -> anyhow::Result<bool> {
     use std::io::IsTerminal as _;
     if !std::io::stdin().is_terminal() {
@@ -377,10 +516,6 @@ fn render_diagnosis(d: &Diagnosis) -> String {
     let mut out = String::new();
     if d.recognised.is_empty() {
         line!(out, "No skilj error recognised (knowledge of skilj {}).", d.knowledge_skilj_version);
-        line!(
-            out,
-            "If this output does come from skilj, that is worth an issue on skilj-agent, with the error's code or message."
-        );
         return out;
     }
     for (i, r) in d.recognised.iter().enumerate() {
@@ -405,10 +540,7 @@ fn render_diagnosis(d: &Diagnosis) -> String {
             }
             (_, _, Some(e)) => {
                 line!(out, "  skilj says: {}", e.message);
-                line!(
-                    out,
-                    "  No cause or fix is recorded for this error yet; when you find it, it's worth an issue on skilj-agent."
-                );
+                line!(out, "  No cause or fix is recorded for this error yet.");
             }
             _ => {}
         }

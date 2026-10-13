@@ -143,6 +143,11 @@ entity PluginType {
     declared_in: rust | skilj_toml
     -- For commands: the `kind` strings of every Rejected branch in decide().
     rejection_kinds: Set<String>
+    -- The ones only reached through another command's logic (ApplyMacro
+    -- calling RequestInfoFromCustomer::decide_on), with those methods.
+    -- The index sees calls, not the arguments passed, so such a kind may
+    -- be unreachable from this command.
+    inherited_rejection_kinds: Set<String>
     -- For projections: the event type names it consumes.
     consumed_event_types: Set<String>
 }
@@ -271,6 +276,8 @@ entity TestObligation {
     source: code_index | allium_spec
     level: unit | integration | compiler
     status: uncovered | covered
+    -- Shown with the finding: "may be unreachable from here".
+    inherited: Boolean
 }
 
 -- All deterministic. Then each obligation is matched against the
@@ -303,7 +310,8 @@ rule DeriveRejectionObligations {
                 obligation_id: obligation_id(command, rejection),
                 source: code_index,
                 level: unit,
-                status: uncovered
+                status: uncovered,
+                inherited: rejection in command.inherited_rejection_kinds
             )
 }
 
@@ -753,6 +761,8 @@ entity Dismissal {
     project: Project
     kind: untested | too_big | mixed_contexts | off_style | performance | known_error
     subject: String
+    -- Why, for whoever reads the config next.
+    note: String?
 }
 
 rule DismissedStaysDismissed {
@@ -763,15 +773,15 @@ rule DismissedStaysDismissed {
 
 -- not_relevant: correct but you don't care (e.g. a context that is
 -- meant to stay in one file). wrong: the check itself is mistaken, e.g.
--- flagged as untested while a test exists. Only wrong ones are a bug in
--- the agent.
+-- flagged as untested while a test exists, or a rejection the command
+-- can't reach. Only wrong ones are a bug in the agent. Both are stored:
+-- a wrong finding is recomputed every session too, until the agent is
+-- fixed.
 rule DismissFinding {
-    when: DismissFinding(by, finding, reason)
+    when: DismissFinding(by, finding, reason, note)
     requires: finding.status = open
     ensures: finding.status = dismissed
-    ensures:
-        if reason = not_relevant:
-            Dismissal.created(project: finding.project, kind: finding.kind, subject: finding.subject)
+    ensures: Dismissal.created(project: finding.project, kind: finding.kind, subject: finding.subject, note: note)
     ensures:
         if reason = wrong:
             IssueSuggestion.created(
@@ -877,6 +887,10 @@ rule ProposalRetries {
     ensures: proposal.status = drafted
 }
 
+-- When a test for a rejection gives up and the obligation is inherited,
+-- or every test that ran was rejected with another of the command's
+-- kinds, the agent says the rejection may be unreachable and shows the
+-- dismissal to add. It doesn't dismiss: only the developer knows.
 rule ProposalGivesUp {
     when: ProposalChecked(proposal, passed)
     requires: proposal.status = verifying
@@ -1058,8 +1072,11 @@ config {
 -- Always search the skilj-agent repo's issues first (open and closed).
 -- A comment adds this occurrence's outcome and versions to the existing
 -- issue, so every occurrence makes that issue easier to fix. Matching is
--- a black box (the model comparing the summary with the found issues).
--- Searching works anonymously: the skilj-agent repo on GitHub is public.
+-- a black box: today an exact key per kind of gap, written into the issue
+-- it opens; for free-text requests, the model comparing the summary with
+-- the found issues. Searching works anonymously: the skilj-agent repo on
+-- GitHub is public. Without a terminal to ask on, a suggestion waits
+-- queued too, merged with others of the same key.
 rule MatchExistingIssue {
     when: IssueSearchDone(suggestion, found)
     requires: suggestion.status = searching
@@ -1138,7 +1155,7 @@ surface Session {
         CloseInvestigation(developer, investigation)
         WriteTest(developer, finding)
         RestructureContext(developer, finding)
-        DismissFinding(developer, finding, reason)
+        DismissFinding(developer, finding, reason, note)
         ApplyProposal(developer, proposal)
         DiscardProposal(developer, proposal, why)
         FileIssue(developer, suggestion)

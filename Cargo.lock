@@ -1741,8 +1741,10 @@ dependencies = [
  "serde_json",
  "skilj-agent-checks",
  "skilj-agent-index",
+ "skilj-agent-issues",
  "skilj-agent-llm",
  "skilj-agent-tasks",
+ "tempfile",
  "tokio",
 ]
 
@@ -1774,6 +1776,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "skilj-agent-issues"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "skilj-agent-llm"
 version = "0.1.0"
 dependencies = [
@@ -1793,6 +1807,7 @@ dependencies = [
  "skilj-agent-llm",
  "skilj-agent-verify",
  "syn 2.0.119",
+ "toml",
 ]
 
 [[package]]

@@ -89,6 +89,7 @@ pub(crate) fn from_specs(index: &ProjectIndex, warnings: &mut Vec<String>) -> Ve
                 level,
                 covered_by,
                 at_other_level: Vec::new(),
+                via: Vec::new(),
             });
         }
     }

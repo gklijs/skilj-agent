@@ -36,14 +36,16 @@ fn command(index: &ProjectIndex, cmd: &PluginType, out: &mut Vec<Obligation>) {
         |t| integration(t) && cmd.rejection_kinds.iter().all(|k| !t.literals.contains(k)),
     ));
     for kind in &cmd.rejection_kinds {
-        out.push(obligation(
+        let mut rejected = obligation(
             index,
             &format!("command.{}.rejected.{kind}", cmd.name),
             &cmd.context,
             Level::Unit,
             |t| unit(t) && t.literals.contains(kind),
             |t| integration(t) && t.literals.contains(kind),
-        ));
+        );
+        rejected.via = cmd.inherited_kinds.get(kind).map(|v| v.iter().cloned().collect()).unwrap_or_default();
+        out.push(rejected);
     }
     out.push(obligation(
         index,
@@ -112,5 +114,6 @@ fn obligation(
         level,
         covered_by,
         at_other_level,
+        via: Vec::new(),
     }
 }

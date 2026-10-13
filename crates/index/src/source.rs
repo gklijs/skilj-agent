@@ -25,6 +25,8 @@ pub struct SourceItem {
     /// trait.
     pub methods: Vec<(String, usize, usize)>,
     pub trait_impl: bool,
+    /// Trait impls: the trait's last path segment (`Snapshot`).
+    pub trait_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +54,7 @@ fn walk(items: &[Item], test_module: Option<&str>, out: &mut Vec<SourceItem>) {
     for item in items {
         let mut methods = Vec::new();
         let mut trait_impl = false;
+        let mut trait_name = None;
         let (name, kind, attrs, variants) = match item {
             Item::Struct(s) => (s.ident.to_string(), ItemKind::Struct, &s.attrs, Vec::new()),
             Item::Enum(e) => (
@@ -69,6 +72,7 @@ fn walk(items: &[Item], test_module: Option<&str>, out: &mut Vec<SourceItem>) {
             Item::Impl(i) => match crate::rust::last_type_ident(&i.self_ty) {
                 Some(name) => {
                     trait_impl = i.trait_.is_some();
+                    trait_name = i.trait_.as_ref().and_then(|(_, path, _)| path.segments.last()).map(|s| s.ident.to_string());
                     for ii in &i.items {
                         if let syn::ImplItem::Fn(m) = ii {
                             let start = m.attrs.iter().map(|a| a.span().start().line).chain([m.span().start().line]).min().unwrap_or(1);
@@ -92,6 +96,7 @@ fn walk(items: &[Item], test_module: Option<&str>, out: &mut Vec<SourceItem>) {
                         variants: Vec::new(),
                         methods: Vec::new(),
                         trait_impl: false,
+                        trait_name: None,
                     });
                     walk(inner, Some(&name), out);
                 } else {
@@ -110,6 +115,7 @@ fn walk(items: &[Item], test_module: Option<&str>, out: &mut Vec<SourceItem>) {
             variants,
             methods,
             trait_impl,
+            trait_name,
         });
     }
 }
@@ -195,6 +201,7 @@ mod tests {
         let imp = items.iter().find(|i| i.kind == ItemKind::Impl).unwrap();
         assert_eq!(imp.name, "Withdraw");
         assert!(imp.trait_impl);
+        assert_eq!(imp.trait_name.as_deref(), Some("CommandType"));
         assert_eq!(imp.methods, vec![("decide".to_string(), 12, 12)]);
         let module = items.iter().find(|i| i.kind == ItemKind::TestModule).unwrap();
         assert_eq!((module.name.as_str(), module.start, module.end), ("tests", 15, 21));

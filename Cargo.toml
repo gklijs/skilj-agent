@@ -1,7 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["crates/index", "crates/checks", "crates/verify", "crates/llm", "crates/tasks", "crates/cli"]
+members = ["crates/index", "crates/checks", "crates/verify", "crates/llm", "crates/tasks", "crates/issues", "crates/cli"]
 
 # index  - reads a skilj project: bounded contexts, plugin types, tests (no model)
 # checks - turns the index into findings: testing, layout, version (no model)
+# issues - suggested issues on the skilj-agent repo: matching, filing, pending ones
 # cli    - the skilj-agent binary

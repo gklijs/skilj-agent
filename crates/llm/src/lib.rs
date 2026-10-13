@@ -26,9 +26,9 @@ pub struct ModelConfig {
     pub context_tokens: u64,
     pub max_answer_tokens: u64,
     pub answer_timeout: Duration,
-    /// Let a thinking model (qwen3) reason before answering: slower,
+    /// When a thinking model (qwen3) reasons before answering: slower,
     /// usually better code.
-    pub think: bool,
+    pub thinking: Thinking,
     pub temperature: f64,
 }
 
@@ -40,8 +40,37 @@ impl Default for ModelConfig {
             context_tokens: DEFAULT_CONTEXT_TOKENS,
             max_answer_tokens: DEFAULT_MAX_ANSWER_TOKENS,
             answer_timeout: DEFAULT_ANSWER_TIMEOUT,
-            think: true,
+            thinking: Thinking::Fallback,
             temperature: 0.2,
+        }
+    }
+}
+
+/// When the model reasons before it answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Thinking {
+    Always,
+    Never,
+    /// The first attempt without: fast, and enough for simple cases.
+    /// Every retry with.
+    Fallback,
+}
+
+impl Thinking {
+    /// Whether attempt `attempt` (from 1) reasons first.
+    pub fn on_attempt(self, attempt: usize) -> bool {
+        match self {
+            Thinking::Always => true,
+            Thinking::Never => false,
+            Thinking::Fallback => attempt > 1,
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Thinking::Always => "thinking",
+            Thinking::Never => "without thinking",
+            Thinking::Fallback => "first without thinking, then with",
         }
     }
 }
@@ -69,9 +98,9 @@ impl ModelConfig {
 }
 
 pub struct Conversation {
-    agent: rig_core::agent::Agent<ollama::CompletionModel>,
-    timeout: Duration,
-    max_tokens: u64,
+    client: ollama::Client,
+    config: ModelConfig,
+    system: String,
     history: Vec<Message>,
 }
 
@@ -91,27 +120,29 @@ impl Conversation {
             .api_key(ollama::OllamaApiKey::default())
             .base_url(&config.ollama_url)
             .build()?;
-        let agent = client
-            .agent(&config.model)
-            .preamble(system)
-            .temperature(config.temperature)
-            .additional_params(serde_json::json!({
-                "think": config.think,
-                "num_ctx": config.context_tokens,
-                "num_predict": config.max_answer_tokens,
-            }))
-            .build();
-        Ok(Conversation { agent, timeout: config.answer_timeout, max_tokens: config.max_answer_tokens, history: Vec::new() })
+        Ok(Conversation { client, config: config.clone(), system: system.to_string(), history: Vec::new() })
     }
 
     /// Sends a message and returns the answer, without any reasoning
-    /// the model did first.
-    pub async fn ask(&mut self, message: &str) -> anyhow::Result<Reply> {
+    /// the model did first. `think`: whether it reasons first; the
+    /// conversation so far is kept either way.
+    pub async fn ask(&mut self, message: &str, think: bool) -> anyhow::Result<Reply> {
         use rig_core::completion::Prompt as _;
         use std::future::IntoFuture as _;
+        let agent = self
+            .client
+            .agent(&self.config.model)
+            .preamble(&self.system)
+            .temperature(self.config.temperature)
+            .additional_params(serde_json::json!({
+                "think": think,
+                "num_ctx": self.config.context_tokens,
+                "num_predict": self.config.max_answer_tokens,
+            }))
+            .build();
         let started = Instant::now();
-        let request = self.agent.prompt(message).history(self.history.clone()).extended_details();
-        let Ok(response) = tokio::time::timeout(self.timeout, request.into_future()).await else {
+        let request = agent.prompt(message).history(self.history.clone()).extended_details();
+        let Ok(response) = tokio::time::timeout(self.config.answer_timeout, request.into_future()).await else {
             return Ok(Reply { text: String::new(), took: started.elapsed(), input_tokens: 0, output_tokens: 0, cut_off: true });
         };
         let response = response.map_err(|e| anyhow::anyhow!("the model didn't answer: {e}"))?;
@@ -121,7 +152,7 @@ impl Conversation {
         let text = strip_thinking(&response.output);
         // Out of tokens: the answer is empty (all reasoning) or has an
         // unclosed code block.
-        let cut_off = response.usage.output_tokens >= self.max_tokens
+        let cut_off = response.usage.output_tokens >= self.config.max_answer_tokens
             || text.is_empty()
             || text.matches("```").count() % 2 == 1;
         Ok(Reply {
@@ -178,6 +209,14 @@ mod tests {
         let text = "Here:\n```toml\na = 1\n```\n```rust\n#[test]\nfn a() {}\n```\nDone.";
         assert_eq!(code_block(text), "#[test]\nfn a() {}");
         assert_eq!(code_block("fn a() {}"), "fn a() {}");
+    }
+
+    #[test]
+    fn fallback_thinks_from_the_second_attempt() {
+        let on = |t: Thinking| (1..=4).map(|a| t.on_attempt(a)).collect::<Vec<_>>();
+        assert_eq!(on(Thinking::Fallback), [false, true, true, true]);
+        assert_eq!(on(Thinking::Always), [true; 4]);
+        assert_eq!(on(Thinking::Never), [false; 4]);
     }
 
     #[test]

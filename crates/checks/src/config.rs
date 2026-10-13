@@ -22,9 +22,16 @@ pub struct ProjectConfig {
 pub struct Dismissal {
     pub kind: FindingKind,
     pub subject: String,
+    /// Why, for whoever reads the config next.
+    pub reason: Option<String>,
 }
 
 impl ProjectConfig {
+    /// The dismissal of this finding, if any.
+    pub fn dismissal(&self, kind: FindingKind, subject: &str) -> Option<&Dismissal> {
+        self.dismissed.iter().find(|d| d.kind == kind && d.subject == subject)
+    }
+
     /// Reads the project's config; a missing file is an empty config.
     pub fn load(root: &Path) -> anyhow::Result<Self> {
         let path = root.join(FILE_NAME);
@@ -50,10 +57,12 @@ mod tests {
             [[dismissed]]
             kind = "too_big"
             subject = "src/routing_guard.rs"
+            reason = "generated"
             "#,
         )
         .unwrap();
         assert_eq!(config.layout_style, Some(LayoutStyle::BySlice));
         assert_eq!(config.dismissed[0].kind, FindingKind::TooBig);
+        assert_eq!(config.dismissal(FindingKind::TooBig, "src/routing_guard.rs").unwrap().reason.as_deref(), Some("generated"));
     }
 }

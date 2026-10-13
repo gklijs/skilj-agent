@@ -94,6 +94,13 @@ pub struct PluginType {
     /// Commands: every `kind` a `CommandDecision::Rejected` reachable from
     /// `decide()` can carry, following calls to helpers in the project.
     pub rejection_kinds: BTreeSet<String>,
+    /// The rejection kinds reached only through another command's code,
+    /// with the methods they are reached through
+    /// (`RequestInfoFromCustomer::decide_on`). The calling command may
+    /// pass arguments that make them unreachable, which the index can't
+    /// see.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub inherited_kinds: BTreeMap<String, BTreeSet<String>>,
     /// Projections: the event `NAME`s from `consumed_event_types()`.
     pub consumed_event_types: BTreeSet<String>,
     /// Projections and snapshots: the `State` type.
@@ -268,6 +275,21 @@ fn resolve(index: &mut ProjectIndex, parsed: Vec<Parsed>) {
         }
     }
 
+    // Every command's Rust type, to tell when a call enters another
+    // command's code.
+    let mut commands: BTreeSet<String> = BTreeSet::new();
+    for p in &parsed {
+        match p {
+            Parsed::Rust { kind: FileKind::Src, file, .. } => {
+                commands.extend(file.impls.iter().filter(|i| i.kind == TypeKind::Command).map(|i| i.rust_name.clone()));
+            }
+            Parsed::Toml { decl, .. } => {
+                commands.extend(decl.types().filter(|(k, _)| *k == TypeKind::Command).map(|(_, n)| n));
+            }
+            _ => {}
+        }
+    }
+
     let mut types = Vec::new();
     for p in &parsed {
         match p {
@@ -277,11 +299,13 @@ fn resolve(index: &mut ProjectIndex, parsed: Vec<Parsed>) {
                         rust::ContextRef::Literal(name) => name.clone(),
                         rust::ContextRef::Inherited => context_of(rel).unwrap_or_else(|| "default".into()),
                     };
-                    let mut rejection_kinds = BTreeSet::new();
+                    let mut kinds = BTreeMap::new();
                     if imp.kind == TypeKind::Command {
                         let fns = [fns_by_context.get(&Some(context.clone())), fns_by_context.get(&None)];
-                        collect_rejections(&imp.decide, Some(&imp.rust_name), &fns, &mut rejection_kinds, &mut BTreeSet::new(), 0);
+                        let walk = Walk { fns: &fns, command: &imp.rust_name, commands: &commands };
+                        collect_rejections(&walk, &imp.decide, Some(&imp.rust_name), None, &mut kinds, &mut BTreeSet::new(), 0);
                     }
+                    let (rejection_kinds, inherited_kinds) = split_kinds(kinds);
                     types.push(PluginType {
                         context,
                         kind: imp.kind,
@@ -291,6 +315,7 @@ fn resolve(index: &mut ProjectIndex, parsed: Vec<Parsed>) {
                         line: imp.line,
                         declared_in: DeclaredIn::Rust,
                         rejection_kinds,
+                        inherited_kinds,
                         consumed_event_types: imp.consumed.clone(),
                         state_type: imp.state_type.clone(),
                     });
@@ -299,13 +324,15 @@ fn resolve(index: &mut ProjectIndex, parsed: Vec<Parsed>) {
             Parsed::Toml { rel, decl, .. } => {
                 let fns = [fns_by_context.get(&Some(decl.bounded_context.clone())), fns_by_context.get(&None)];
                 for (kind, name) in decl.types() {
-                    let mut rejection_kinds = BTreeSet::new();
+                    let mut kinds = BTreeMap::new();
                     if kind == TypeKind::Command {
                         // skilj-codegen's generated decide() delegates to a
                         // hand-written decide_<snake_case name>.
                         let start = rust::Facts::calling(&codegen::decide_fn_name(&name));
-                        collect_rejections(&start, None, &fns, &mut rejection_kinds, &mut BTreeSet::new(), 0);
+                        let walk = Walk { fns: &fns, command: &name, commands: &commands };
+                        collect_rejections(&walk, &start, None, None, &mut kinds, &mut BTreeSet::new(), 0);
                     }
+                    let (rejection_kinds, inherited_kinds) = split_kinds(kinds);
                     types.push(PluginType {
                         context: decl.bounded_context.clone(),
                         kind,
@@ -315,6 +342,7 @@ fn resolve(index: &mut ProjectIndex, parsed: Vec<Parsed>) {
                         line: 0,
                         declared_in: DeclaredIn::SkiljToml,
                         rejection_kinds,
+                        inherited_kinds,
                         consumed_event_types: BTreeSet::new(),
                         state_type: None,
                     });
@@ -417,21 +445,51 @@ const MAX_CALL_DEPTH: usize = 4;
 
 type FnsByName<'a> = BTreeMap<String, Vec<&'a rust::FnModel>>;
 
+/// What a walk out of one command's `decide()` needs.
+struct Walk<'a> {
+    fns: &'a [Option<&'a FnsByName<'a>>],
+    /// The command walked from.
+    command: &'a str,
+    commands: &'a BTreeSet<String>,
+}
+
+/// Every kind with `None` when the command's own code reaches it, else
+/// the other commands' methods it is only reached through.
+type KindsFound = BTreeMap<String, Option<BTreeSet<String>>>;
+
+fn split_kinds(kinds: KindsFound) -> (BTreeSet<String>, BTreeMap<String, BTreeSet<String>>) {
+    let inherited = kinds.iter().filter_map(|(k, via)| via.clone().map(|v| (k.clone(), v))).collect();
+    (kinds.into_keys().collect(), inherited)
+}
+
 /// Follows `decide()` into the helpers it calls, collecting every
 /// rejection kind on the way. Calls are resolved by owner where syntax
 /// allows; a method call on an unknown receiver is only followed when
 /// one type defines that method, so a miss is likelier than a kind that
-/// isn't really there.
+/// isn't really there. A kind only found past a method of another
+/// command is recorded with that method: the walk can't see whether the
+/// arguments passed make it reachable.
 fn collect_rejections(
+    walk: &Walk<'_>,
     facts: &rust::Facts,
     owner: Option<&str>,
-    fns: &[Option<&FnsByName>],
-    kinds: &mut BTreeSet<String>,
-    seen: &mut BTreeSet<(Option<String>, String)>,
+    via: Option<&str>,
+    kinds: &mut KindsFound,
+    seen: &mut BTreeSet<(Option<String>, String, bool)>,
     depth: usize,
 ) {
     use crate::facts::Call;
-    kinds.extend(facts.rejections.iter().cloned());
+    for kind in &facts.rejections {
+        match (kinds.get_mut(kind), via) {
+            (Some(None), _) => {}
+            (Some(Some(vias)), Some(v)) => {
+                vias.insert(v.to_string());
+            }
+            (_, v) => {
+                kinds.insert(kind.clone(), v.map(|v| BTreeSet::from([v.to_string()])));
+            }
+        }
+    }
     if depth >= MAX_CALL_DEPTH {
         return;
     }
@@ -442,7 +500,8 @@ fn collect_rejections(
             Call::OnType(t, n) => (n, Some(Some(t.as_str()))),
             Call::Method(n) => (n, None),
         };
-        let candidates: Vec<&rust::FnModel> = fns
+        let candidates: Vec<&rust::FnModel> = walk
+            .fns
             .iter()
             .flatten()
             .flat_map(|m| m.get(name).into_iter().flatten().copied())
@@ -459,8 +518,14 @@ fn collect_rejections(
             }
         }
         for f in candidates {
-            if seen.insert((f.owner.clone(), f.name.clone())) {
-                collect_rejections(&f.facts, f.owner.as_deref(), fns, kinds, seen, depth + 1);
+            let enters_other = f.owner.as_deref().is_some_and(|o| o != walk.command && walk.commands.contains(o));
+            let via_here = match (via, enters_other) {
+                (Some(v), _) => Some(v.to_string()),
+                (None, true) => Some(format!("{}::{}", f.owner.as_deref().unwrap_or_default(), f.name)),
+                (None, false) => None,
+            };
+            if seen.insert((f.owner.clone(), f.name.clone(), via_here.is_some())) {
+                collect_rejections(walk, &f.facts, f.owner.as_deref(), via_here.as_deref(), kinds, seen, depth + 1);
             }
         }
     }

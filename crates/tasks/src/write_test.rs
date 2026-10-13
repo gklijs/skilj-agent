@@ -10,19 +10,30 @@
 //!    obligation (the same matching `check` uses), and
 //! 3. `cargo test` in a scratch copy compiles it and it passes.
 //!
-//! Anything that fails goes back to the model, up to `MAX_ATTEMPTS`.
+//! Anything that fails goes back to the model, up to `MAX_ATTEMPTS`
+//! with thinking; with `Thinking::Fallback`, after one fast attempt
+//! without.
 
 use anyhow::{Context as _, bail};
-use skilj_agent_checks::{Level, Source, code_obligations};
+use skilj_agent_checks::{FindingKind, Level, ProjectConfig, Source, code_obligations};
 use skilj_agent_index::source::{self, ItemKind, SourceItem};
 use skilj_agent_index::{DeclaredIn, FileKind, PluginType, ProjectIndex, TestLevel, TypeKind};
-use skilj_agent_llm::{Conversation, ModelConfig, Reply, code_block};
+use skilj_agent_llm::{Conversation, ModelConfig, Reply, Thinking, code_block};
 use skilj_agent_verify::{Outcome, Scratch, Target, Touched};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Spec: config.max_attempts.
 pub const MAX_ATTEMPTS: usize = 3;
+
+/// The attempts a run makes: the fast first one without thinking comes
+/// on top, so thinking keeps all of its own.
+pub fn attempts(thinking: Thinking) -> usize {
+    match thinking {
+        Thinking::Fallback => MAX_ATTEMPTS + 1,
+        _ => MAX_ATTEMPTS,
+    }
+}
 /// The code shown besides the type itself, in lines.
 const CONTEXT_BUDGET: usize = 500;
 /// How deep references are followed from the type.
@@ -53,12 +64,17 @@ pub struct Plan {
     pub kind: TypeKind,
     /// Rejection kinds of the command, for the accepted path.
     pub rejection_kinds: BTreeSet<String>,
+    /// A rejection reached only through other commands' code: those
+    /// methods. It may be unreachable from this command.
+    pub via: Vec<String>,
     /// Where the test goes, relative to the project root.
     pub file: String,
     pub package: String,
     pub placement: Placement,
     /// The code the model sees, by file.
     pub context: Vec<Excerpt>,
+    /// The snapshots shown in the context, as (Rust type, its `NAME`).
+    pub snapshots: Vec<(String, String)>,
     pub example: Option<Excerpt>,
     /// Names already taken in the module the test goes into.
     pub taken: BTreeSet<String>,
@@ -94,7 +110,7 @@ pub struct Excerpt {
 /// What the run reports while it works.
 #[derive(Debug)]
 pub enum Progress<'a> {
-    Asking { attempt: usize, message: &'a str },
+    Asking { attempt: usize, think: bool, message: &'a str },
     Answered { attempt: usize, reply: &'a Reply },
     Building,
     Problem { attempt: usize, problem: &'a Problem },
@@ -172,8 +188,9 @@ impl Problem {
 pub enum RunOutcome {
     /// Verified: compiles, passes, covers the obligation.
     Verified(Proposal),
-    /// Every attempt had a problem; the last one.
-    GaveUp { attempts: usize, last: Problem },
+    /// Every attempt had a problem; the last one, and why the obligation
+    /// may be unreachable when there are signs of it.
+    GaveUp { attempts: usize, last: Problem, unreachable: Option<String> },
     /// The project doesn't build as it is: nothing the model can fix.
     ProjectBroken(Vec<String>),
 }
@@ -205,7 +222,11 @@ impl Proposal {
 
 /// Picks the obligation's type, the code to show and where the test
 /// goes. No model involved.
-pub fn plan(index: &ProjectIndex, obligation: &str) -> anyhow::Result<Plan> {
+pub fn plan(index: &ProjectIndex, config: &ProjectConfig, obligation: &str) -> anyhow::Result<Plan> {
+    if let Some(d) = config.dismissal(FindingKind::Untested, obligation) {
+        let why = d.reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default();
+        bail!("`{obligation}` is dismissed in .skilj-agent.toml{why}");
+    }
     let found = code_obligations(index).into_iter().find(|o| o.id == obligation);
     let Some(found) = found else {
         bail!("no obligation `{obligation}` in this project; `skilj-agent check --all` lists them");
@@ -248,7 +269,7 @@ pub fn plan(index: &ProjectIndex, obligation: &str) -> anyhow::Result<Plan> {
         }
         _ => "project".to_string(),
     };
-    let context = select_context(index, ty, &goal, &sources);
+    let (context, snapshots) = select_context(index, ty, &goal, &sources);
 
     let (example, example_module) = pick_example(index, ty, &file, &sources);
     let target_items = &sources.get(&file).context("the test file is not readable")?.1;
@@ -270,10 +291,12 @@ pub fn plan(index: &ProjectIndex, obligation: &str) -> anyhow::Result<Plan> {
         call,
         kind,
         rejection_kinds: ty.rejection_kinds.clone(),
+        via: found.via.clone(),
         file,
         package,
         placement,
         context,
+        snapshots,
         example,
         taken,
     })
@@ -328,8 +351,15 @@ type Piece = (String, usize, Option<usize>); // (file, item index, method index)
 /// items by name, and methods of the package's own impls by method name.
 /// An enum's variants pull in only the payloads of variants that are
 /// used, so a large event enum doesn't bring every payload with it. For
-/// a rejection, the code holding its kind is always shown.
-fn select_context(index: &ProjectIndex, ty: &PluginType, goal: &Goal, sources: &Sources) -> Vec<Excerpt> {
+/// a rejection, the code holding its kind is always shown. A snapshot
+/// type brings its `impl Snapshot`, so the model can read its `NAME` and
+/// `State`; those are returned too.
+fn select_context(
+    index: &ProjectIndex,
+    ty: &PluginType,
+    goal: &Goal,
+    sources: &Sources,
+) -> (Vec<Excerpt>, Vec<(String, String)>) {
     let mut chosen: BTreeSet<Piece> = BTreeSet::new();
     let mut excerpts = Vec::new();
 
@@ -411,7 +441,10 @@ fn select_context(index: &ProjectIndex, ty: &PluginType, goal: &Goal, sources: &
                     item.kind,
                     ItemKind::Struct | ItemKind::Enum | ItemKind::Fn | ItemKind::Const | ItemKind::TypeAlias
                 ) && idents.contains(&item.name);
-                if by_name {
+                let snapshot_impl = item.kind == ItemKind::Impl
+                    && item.trait_name.as_deref() == Some("Snapshot")
+                    && idents.contains(&item.name);
+                if by_name || snapshot_impl {
                     next.push((file.clone(), i, None));
                 }
                 // A method only when its type is in play too: method
@@ -451,6 +484,8 @@ fn select_context(index: &ProjectIndex, ty: &PluginType, goal: &Goal, sources: &
             let item = &sources[&piece.0].1[piece.1];
             if item.kind == ItemKind::Enum {
                 enums.push((piece.0.clone(), piece.1));
+            } else if item.trait_impl && piece.2.is_none() {
+                idents.extend(seed_idents(sources, &(piece.0.clone(), piece.1)));
             } else {
                 idents.extend(piece_idents(sources, &piece));
             }
@@ -471,8 +506,28 @@ fn select_context(index: &ProjectIndex, ty: &PluginType, goal: &Goal, sources: &
             }
         }
     }
+    let snapshots = chosen
+        .iter()
+        .filter(|p| p.2.is_none())
+        .filter_map(|p| {
+            let (text, items) = &sources[&p.0];
+            let item = &items[p.1];
+            if item.trait_name.as_deref() != Some("Snapshot") {
+                return None;
+            }
+            const_str(&source::lines(text, item.start, item.end), "NAME").map(|name| (item.name.clone(), name))
+        })
+        .collect();
     render(sources, &chosen, &mut excerpts);
-    excerpts
+    (excerpts, snapshots)
+}
+
+/// The string value of `const <name>: &str = "..."` in `code`.
+fn const_str(code: &str, name: &str) -> Option<String> {
+    let prefix = format!("const {name}:");
+    let line = code.lines().map(str::trim).find(|l| l.starts_with(&prefix))?;
+    let (_, value) = line.split_once('=')?;
+    Some(value.trim().trim_end_matches(';').trim().strip_prefix('"')?.strip_suffix('"')?.to_string())
 }
 
 fn is_bin(file: &str) -> bool {
@@ -729,10 +784,21 @@ impl Plan {
                 "Write a unit test showing that command `{}` (Rust type `{}`) accepts valid input: call `{}::{}(...)` and check the decision is `CommandDecision::Accepted`, with the events it returns.",
                 self.type_name, self.rust_name, self.rust_name, self.call
             ),
-            Goal::Rejected(kind) => format!(
-                "Write a unit test showing that command `{}` (Rust type `{}`) rejects with kind \"{kind}\": call `{}::{}(...)` with input that triggers exactly that rejection, and assert the kind is \"{kind}\".",
-                self.type_name, self.rust_name, self.rust_name, self.call
-            ),
+            Goal::Rejected(kind) => {
+                let mut text = format!(
+                    "Write a unit test showing that command `{}` (Rust type `{}`) rejects with kind \"{kind}\": call `{}::{}(...)` with input that triggers exactly that rejection, and assert the kind is \"{kind}\".",
+                    self.type_name, self.rust_name, self.rust_name, self.call
+                );
+                if !self.via.is_empty() {
+                    text.push_str(&format!(
+                        " That kind comes from {}, which `{}` calls: build input that gets past `{}`'s own checks and makes that call reject.",
+                        self.via_text(),
+                        self.rust_name,
+                        self.rust_name
+                    ));
+                }
+                text
+            }
             Goal::Folds(event) => format!(
                 "Write a unit test showing how projection `{}` (Rust type `{}`) folds the event `{event}`: call `{}::project(...)` with a `{event}` event and assert on the resulting state.",
                 self.type_name, self.rust_name, self.rust_name
@@ -740,8 +806,74 @@ impl Plan {
         }
     }
 
+    /// How to hand the command its snapshot states: the `NAME` is a
+    /// string models guess wrong, and a wrong one reads as no snapshot.
+    fn snapshot_text(&self) -> Option<String> {
+        if self.call != "decide_with" || self.snapshots.is_empty() {
+            return None;
+        }
+        let names: Vec<String> = self
+            .snapshots
+            .iter()
+            .map(|(ty, name)| format!("`{ty}` has `NAME` \"{name}\": set `snapshot: \"{name}\".to_string()`"))
+            .collect();
+        Some(format!(
+            "The command reads snapshot state from the `Decision`: build it with `Decision::new(&events, &snapshots)` and a `SnapshotState` per snapshot. {}. Use exactly that string; any other name finds no snapshot.",
+            names.join("; ")
+        ))
+    }
+
+    fn via_text(&self) -> String {
+        let names: Vec<_> = self.via.iter().map(|v| format!("`{v}`")).collect();
+        names.join(" or ")
+    }
+
+    /// The command's rejection kinds other than the one asked for that
+    /// a failed test's output names, like `left: "macro_not_found"`.
+    fn other_kinds_in(&self, output: &str) -> BTreeSet<String> {
+        let asked = match &self.goal {
+            Goal::Rejected(kind) => Some(kind),
+            _ => None,
+        };
+        self.rejection_kinds
+            .iter()
+            .filter(|k| Some(*k) != asked && output.contains(&format!("\"{k}\"")))
+            .cloned()
+            .collect()
+    }
+
+    /// After giving up on a rejection: why it may be unreachable, and
+    /// how to dismiss it if so. `rejected_instead`: the other kinds every
+    /// test that ran was rejected with, when that's the case.
+    pub fn unreachable_hint(&self, rejected_instead: Option<&BTreeSet<String>>) -> Option<String> {
+        let Goal::Rejected(kind) = &self.goal else { return None };
+        let why = match (self.via.is_empty(), rejected_instead) {
+            (false, _) => format!(
+                "\"{kind}\" is only reached through {}, and what `{}` passes may never trigger it.",
+                self.via_text(),
+                self.rust_name
+            ),
+            (true, Some(others)) => {
+                let names: Vec<_> = others.iter().map(|k| format!("\"{k}\"")).collect();
+                format!("Every test that ran was rejected earlier, with {}.", names.join(" or "))
+            }
+            (true, None) => return None,
+        };
+        Some(format!(
+            "{why} It may be unreachable from {}. If you're sure it is, dismiss it in .skilj-agent.toml:\n\n\
+             [[dismissed]]\n\
+             kind = \"untested\"\n\
+             subject = \"{}\"\n\
+             reason = \"<why it can't happen>\"",
+            self.rust_name, self.obligation
+        ))
+    }
+
     pub fn task_prompt(&self) -> String {
         let mut out = format!("{}\n\n", self.goal_text());
+        if let Some(text) = self.snapshot_text() {
+            out.push_str(&format!("{text}\n\n"));
+        }
         out.push_str("## The code\n\n");
         for e in &self.context {
             out.push_str(&format!("// {}\n```rust\n{}\n```\n\n", e.title, e.code));
@@ -963,6 +1095,10 @@ pub async fn run(
     let mut conversation = Conversation::new(model, &plan.system_prompt())?;
     let mut message = plan.task_prompt();
     let mut last = None;
+    // Tests that ran and failed, and the command's other kinds they hit.
+    let mut failed_runs = 0;
+    let mut hit_other = 0;
+    let mut other_kinds = BTreeSet::new();
     let package_rel = plan.file.find("src/").map_or(plan.file.as_str(), |at| &plan.file[at..]);
     let package_dir = &plan.file[..plan.file.len() - package_rel.len()];
     let target = match Target::of_file(package_rel) {
@@ -970,9 +1106,11 @@ pub async fn run(
         t => t,
     };
 
-    for attempt in 1..=MAX_ATTEMPTS {
-        progress(Progress::Asking { attempt, message: &message });
-        let reply = conversation.ask(&message).await?;
+    let max = attempts(model.thinking);
+    for attempt in 1..=max {
+        let think = model.thinking.on_attempt(attempt);
+        progress(Progress::Asking { attempt, think, message: &message });
+        let reply = conversation.ask(&message, think).await?;
         progress(Progress::Answered { attempt, reply: &reply });
 
         let extracted = if reply.cut_off { Err(Problem::CutOff) } else { extract_test(&reply.text, &plan.taken) };
@@ -1010,7 +1148,15 @@ pub async fn run(
                             }
                             Outcome::BrokenElsewhere(errors) => return Ok(RunOutcome::ProjectBroken(errors)),
                             Outcome::CompileErrors(e) => Problem::CompileErrors(e),
-                            Outcome::TestFailed(out) => Problem::TestFailed(out),
+                            Outcome::TestFailed(out) => {
+                                failed_runs += 1;
+                                let hit = plan.other_kinds_in(&out);
+                                if !hit.is_empty() {
+                                    hit_other += 1;
+                                }
+                                other_kinds.extend(hit);
+                                Problem::TestFailed(out)
+                            }
                             Outcome::TestNotRun => Problem::TestNotRun,
                         }
                     }
@@ -1021,7 +1167,12 @@ pub async fn run(
         message = problem.feedback();
         last = Some(problem);
     }
-    Ok(RunOutcome::GaveUp { attempts: MAX_ATTEMPTS, last: last.expect("at least one attempt") })
+    let every_run_hit_other = failed_runs > 0 && hit_other == failed_runs;
+    Ok(RunOutcome::GaveUp {
+        attempts: max,
+        last: last.expect("at least one attempt"),
+        unreachable: plan.unreachable_hint(every_run_hit_other.then_some(&other_kinds)),
+    })
 }
 
 /// Whether the index, rerun on the changed copy, counts the new test as
@@ -1039,6 +1190,23 @@ fn covers(scratch: &Path, plan: &Plan, test: &str) -> Result<(), Problem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_a_const_string() {
+        let code = "impl Snapshot for S {\n    type State = F;\n    const NAME: &'static str = \"TicketSnapshot\";\n}";
+        assert_eq!(const_str(code, "NAME").as_deref(), Some("TicketSnapshot"));
+        assert_eq!(const_str(code, "TAG_KEY"), None);
+    }
+
+    #[test]
+    fn finds_the_other_kinds_a_failed_test_was_rejected_with() {
+        let mut plan = test_plan();
+        plan.goal = Goal::Rejected("requester_mismatch".into());
+        plan.rejection_kinds = ["macro_not_found", "requester_mismatch", "ticket_not_found"].map(String::from).into();
+        let out = "assertion `left == right` failed\n  left: \"macro_not_found\"\n right: \"requester_mismatch\"";
+        assert_eq!(plan.other_kinds_in(out), BTreeSet::from(["macro_not_found".to_string()]));
+        assert!(plan.other_kinds_in("panicked at 'expected a rejection'").is_empty());
+    }
 
     #[test]
     fn reads_obligation_ids() {
@@ -1118,10 +1286,12 @@ mod tests {
             call: "decide".into(),
             kind: TypeKind::Command,
             rejection_kinds: BTreeSet::new(),
+            via: Vec::new(),
             file: "src/a.rs".into(),
             package: "a".into(),
             placement: Placement::NewModule { name: "tests".into() },
             context: Vec::new(),
+            snapshots: Vec::new(),
             example: None,
             taken: BTreeSet::new(),
         }

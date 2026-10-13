@@ -1,0 +1,10 @@
+# A tiny skilj project with a snapshot, for skilj-agent's own tests. Never built: only read.
+[package]
+name = "ticket-fixture"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+skilj = "0.0.10"
+
+[workspace]

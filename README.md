@@ -59,11 +59,17 @@ Optional, in the project root, committed: decisions for the whole team.
 # by_kind, by_slice or crate_per_context
 layout_style = "by_slice"
 
-# Findings that are correct but not relevant here. They stay dismissed.
+# Findings that are not relevant here, or wrong. They stay dismissed, and
+# write-test refuses a dismissed obligation.
 [[dismissed]]
 kind = "too_big"
 subject = "src/helpdesk/ticket_commands.rs"
+reason = "one file per aggregate, on purpose"   # optional
 ```
+
+A rejection a command only reaches through another command's logic (`ApplyMacro` calling
+`RequestInfoFromCustomer::decide_on`) is reported with "only reached through ..., so it may be
+unreachable from here": the index sees the call, not the arguments passed.
 
 ## `skilj-agent diagnose`
 
@@ -104,9 +110,34 @@ test, and the model writes only the test function:
 - **Your files** are only changed when you confirm, or with `--apply`, and only if the file hasn't
   changed in the meantime.
 
+When it gives up on a rejection that is inherited like that, or every test that ran was
+rejected with another of the command's kinds, it says the rejection may be unreachable and
+prints the `[[dismissed]]` entry to add. It never dismisses anything itself.
+
+`scripts/eval-write-test.py <project> results.jsonl [--no-think]` runs it over every untested unit
+obligation and records each outcome, for comparing models and changes.
+
 The model is `qwen3:14b` on Ollama by default (`--model`, `SKILJ_AGENT_MODEL`, `OLLAMA_HOST`),
-with a 16k context and at most 8k tokens and 6 minutes per answer. `--no-think` turns reasoning
-off: faster, usually worse.
+with a 16k context and at most 8k tokens and 6 minutes per answer. `--thinking` sets when it
+reasons first: `fallback` (the default) answers once without, which is enough for simple cases
+in a fraction of the time, then retries with thinking, three attempts of its own; `always`;
+`never` (or `--no-think`).
+
+## Suggested issues
+
+Whatever the agent can't do, or does wrong, becomes a suggested issue on
+[gklijs/skilj-agent](https://github.com/gklijs/skilj-agent/issues), so it can learn it: `write-test`
+giving up or proposing a wrong test, `diagnose` not recognising skilj output or knowing no fix.
+
+- **Never project code:** the text is built from fixed categories, versions and the model's name.
+- **One issue per gap:** each suggestion has a key (`write-test/gave-up/command/test-failed`) that
+  is written into the issue. When an issue with that key exists, open or closed, the suggestion
+  becomes a comment on it with this occurrence.
+- **Only with your yes:** you see the exact text, and can edit it, before anything is posted.
+  Posted with `gh` when it's logged in, otherwise from a pre-filled GitHub page.
+- **Later:** without a terminal (`cargo test | skilj-agent diagnose`), or when GitHub can't be
+  reached, it's kept in `~/.config/skilj-agent/pending-issues.json`, merged by key.
+  `skilj-agent issues` offers what's waiting.
 
 ## Knowledge
 
@@ -127,6 +158,7 @@ All are compiled into the binary. A test checks that every fix names a variant t
 | `crates/verify` | Scratch copies and `cargo test` runs, with errors sorted into the proposal's own and the project's. |
 | `crates/llm` | The model, through rig: Ollama for now. |
 | `crates/tasks` | Tasks that use a model: `write_test`. |
+| `crates/issues` | Suggested issues: matching by key, filing with `gh` or the browser, pending ones. |
 | `crates/cli` | The `skilj-agent` binary. |
 
 `crates/checks/tests/fixtures/wallet` is a small project with known coverage, used by the

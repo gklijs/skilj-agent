@@ -10,6 +10,8 @@ serde = "1.0.229"
 serde_json = "1.0.154"
 skilj-agent-checks = { version = "0.1.0", path = "../checks" }
 skilj-agent-index = { version = "0.1.0", path = "../index" }
+skilj-agent-issues = { version = "0.1.0", path = "../issues" }
 skilj-agent-llm = { version = "0.1.0", path = "../llm" }
 skilj-agent-tasks = { version = "0.1.0", path = "../tasks" }
+tempfile = "3.27.0"
 tokio = { version = "1", features = ["rt", "macros"] }

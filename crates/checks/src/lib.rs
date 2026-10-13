@@ -141,6 +141,11 @@ pub struct Obligation {
     /// When uncovered: tests exercising the same thing at the other
     /// level, e.g. a rejection only checked by an integration test.
     pub at_other_level: Vec<String>,
+    /// A rejection reached only through other commands' code: those
+    /// methods (`RequestInfoFromCustomer::decide_on`). It may be
+    /// unreachable, depending on what the command passes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub via: Vec<String>,
 }
 
 impl Obligation {
@@ -210,12 +215,7 @@ pub fn check(index: &ProjectIndex, config: &ProjectConfig) -> Report {
     findings.extend(layout::findings(index, &contexts, config.layout_style));
 
     let before = findings.len();
-    findings.retain(|f| {
-        !config
-            .dismissed
-            .iter()
-            .any(|d| d.kind == f.kind && d.subject == f.subject)
-    });
+    findings.retain(|f| config.dismissal(f.kind, &f.subject).is_none());
     let dismissed = before - findings.len();
 
     Report {
@@ -255,12 +255,16 @@ fn untested_detail(o: &Obligation) -> String {
         Level::Integration => "no integration test",
         Level::Compiler => "not covered",
     };
-    match (&o.source, o.at_other_level.as_slice()) {
+    let detail = match (&o.source, o.at_other_level.as_slice()) {
         (Source::AlliumSpec { spec }, _) => format!("{wanted} marked `// allium: {}` ({spec})", o.id),
         (_, []) => wanted.to_string(),
         (_, [one]) => format!("{wanted}; only tested by {one}"),
         (_, [first, rest @ ..]) => format!("{wanted}; only tested by {first} and {} more", rest.len()),
+    };
+    if o.via.is_empty() {
+        return detail;
     }
+    format!("{detail}; only reached through {}, so it may be unreachable from here", o.via.join(" or "))
 }
 
 fn version_fit(requirement: Option<&str>) -> VersionFit {
