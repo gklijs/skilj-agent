@@ -1,0 +1,15 @@
+[package]
+name = "skilj-agent-split"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+prettyplease = "0.2"
+quote = "1"
+skilj-agent-checks = { version = "0.1.0", path = "../checks" }
+skilj-agent-index = { version = "0.1.0", path = "../index" }
+syn = { version = "2", features = ["full", "extra-traits"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

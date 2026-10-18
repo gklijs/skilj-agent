@@ -8,6 +8,17 @@ a model only does the parts that need judgement or new text. See
 
 `check` and `diagnose` use no model. `write-test` is the first command that does.
 
+## `skilj-agent new`
+
+```sh
+skilj-agent new ../my-shop --name my-shop --context orders --style by_slice
+```
+
+Starts a new skilj project from the bundled template (a working
+deposit/withdraw `wallet` app with a runnable server): names the
+package, renames the example context to the first context, and
+remembers the layout style in `.skilj-agent.toml`. No model involved.
+
 ## `skilj-agent check`
 
 ```sh
@@ -114,6 +125,22 @@ When it gives up on a rejection that is inherited like that, or every test that 
 rejected with another of the command's kinds, it says the rejection may be unreachable and
 prints the `[[dismissed]]` entry to add. It never dismisses anything itself.
 
+## `skilj-agent split-context`
+
+```sh
+skilj-agent split-context helpdesk --path ../skilj-helpdesk
+skilj-agent split-context helpdesk --path ../skilj-helpdesk --style by_kind --apply
+```
+
+Splits one single-file bounded context into the shape the project's
+layout style prescribes (`by_kind`: `events.rs` + `commands.rs` +
+`projections.rs`; `by_slice`: one file per command/projection, shared
+events and helpers in `events.rs`). Mechanical, no model: items move
+with `syn`, shared helpers are imported from `events.rs`, the result
+is `cargo check`ed in a scratch copy, and your files only change when
+you confirm (or with `--apply`). Refused with a reason for
+`crate_per_context`, codegen contexts, and contexts sharing files.
+
 `scripts/eval-write-test.py <project> results.jsonl [--no-think]` runs it over every untested unit
 obligation and records each outcome, for comparing models and changes.
 
@@ -159,6 +186,8 @@ All are compiled into the binary. A test checks that every fix names a variant t
 | `crates/llm` | The model, through rig: Ollama for now. |
 | `crates/tasks` | Tasks that use a model: `write_test`. |
 | `crates/issues` | Suggested issues: matching by key, filing with `gh` or the browser, pending ones. |
+| `crates/new` | `new`: the bundled skilj-template plus the crate/context rename. No model. |
+| `crates/split` | `split-context`: the mechanical syn-based context split. No model. |
 | `crates/cli` | The `skilj-agent` binary. |
 
 `crates/checks/tests/fixtures/wallet` is a small project with known coverage, used by the

@@ -10,7 +10,7 @@ use skilj_agent_issues::{Occurrence, Suggestion};
 use skilj_agent_llm::{ModelConfig, Thinking};
 use skilj_agent_tasks::write_test::{self, Progress, RunOutcome};
 use skilj_agent_checks::{
-    FindingKind, Level, ProjectConfig, Report, Source, VersionFit, config, layout,
+    FindingKind, LayoutStyle, Level, ProjectConfig, Report, Source, VersionFit, config, layout,
 };
 use std::io::Read as _;
 use std::collections::BTreeMap;
@@ -93,6 +93,58 @@ enum Command {
     /// becomes knowledge it ships. Nothing is posted without your yes, and
     /// a suggestion never holds your project's code.
     Issues,
+    /// Start a new skilj project from the bundled template.
+    ///
+    /// Copies the template, names the package, and renames the `wallet`
+    /// example context to the first context. No model involved.
+    New {
+        /// Where to create the project.
+        path: PathBuf,
+        /// The package name, e.g. `my-shop`.
+        #[arg(long)]
+        name: String,
+        /// The first bounded context, e.g. `orders`.
+        #[arg(long)]
+        context: String,
+        /// How contexts are laid out; remembered in `.skilj-agent.toml`.
+        #[arg(long, value_enum, default_value_t = StyleArg::BySlice)]
+        style: StyleArg,
+    },
+    /// Split one bounded context into per-style files, verified first.
+    ///
+    /// Mechanical, no model: moves the context's types into the shape
+    /// the project's layout style prescribes, builds the result in a
+    /// scratch copy, and only changes your files when you say so.
+    SplitContext {
+        /// The bounded context to split.
+        context: String,
+        /// The project.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// The style to split into; defaults to the project's own.
+        #[arg(long, value_enum)]
+        style: Option<StyleArg>,
+        /// Apply without asking.
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum StyleArg {
+    ByKind,
+    BySlice,
+    CratePerContext,
+}
+
+impl From<StyleArg> for LayoutStyle {
+    fn from(s: StyleArg) -> Self {
+        match s {
+            StyleArg::ByKind => LayoutStyle::ByKind,
+            StyleArg::BySlice => LayoutStyle::BySlice,
+            StyleArg::CratePerContext => LayoutStyle::CratePerContext,
+        }
+    }
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -134,6 +186,8 @@ fn main() -> ExitCode {
             run_write_test(&path, &obligation, &config, apply, show_prompt, transcript.as_deref())
         }
         Command::Issues => issue::run_pending(),
+        Command::New { path, name, context, style } => run_new(&path, &name, &context, style.into()),
+        Command::SplitContext { context, path, style, apply } => run_split(&path, &context, style.map(LayoutStyle::from), apply),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -142,6 +196,55 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn run_new(path: &Path, name: &str, context: &str, style: LayoutStyle) -> anyhow::Result<()> {
+    skilj_agent_new::create(path, name, context, style)?;
+    println!("created {name} at {} (first context: {context})", path.display());
+    Ok(())
+}
+
+/// Splits one context (spec: RestructureContext): plans the move,
+/// replays it in a scratch copy, `cargo check`s it there, and applies
+/// it to the working tree only on confirmation.
+fn run_split(path: &Path, context: &str, style: Option<LayoutStyle>, apply: bool) -> anyhow::Result<()> {
+    let index = skilj_agent_index::index(path)?;
+    let config = ProjectConfig::load(&index.root)?;
+    let style = match style {
+        Some(s) => s,
+        None => config.layout_style.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no layout style set; pass --style or choose one in {} (by_kind, by_slice, crate_per_context)",
+                config::FILE_NAME
+            )
+        })?,
+    };
+    let plan = skilj_agent_split::plan(&index, context, style)?;
+    println!("splitting {context} into {} ({}):", plan.dir, style.describe());
+    for f in &plan.files {
+        println!("  {}", f.path);
+    }
+    // Verify in a scratch copy first.
+    let scratch = skilj_agent_verify::Scratch::of(&index.root)?;
+    let scratch_index = skilj_agent_index::index(scratch.path())?;
+    let scratch_plan = skilj_agent_split::plan(&scratch_index, context, style)?;
+    skilj_agent_split::apply(scratch.path(), &scratch_index, &scratch_plan)?;
+    println!("verifying with `cargo check` in a scratch copy...");
+    match skilj_agent_verify::check(&scratch)? {
+        skilj_agent_verify::CheckOutcome::Passed => {}
+        skilj_agent_verify::CheckOutcome::Failed(errors) => {
+            println!("the split doesn't compile; nothing was changed. First error:");
+            println!("{}", errors.first().map(String::as_str).unwrap_or_default());
+            return Ok(());
+        }
+    }
+    if apply || confirm(&format!("Apply the split of {context}?"))? {
+        skilj_agent_split::apply(&index.root, &index, &plan)?;
+        println!("split {context} into {}.", plan.dir);
+    } else {
+        println!("Not applied.");
+    }
+    Ok(())
 }
 
 fn run_check(path: &Path, json: bool, all: bool) -> anyhow::Result<()> {

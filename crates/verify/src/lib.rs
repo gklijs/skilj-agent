@@ -90,6 +90,47 @@ impl Scratch {
     }
 }
 
+/// `cargo check` on a scratch copy, e.g. after a mechanical split: the
+/// whole workspace must compile, so there is no touched range.
+pub fn check(scratch: &Scratch) -> anyhow::Result<CheckOutcome> {
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(scratch.path())
+        .env("CARGO_TARGET_DIR", &scratch.target_dir)
+        .args(["check", "--message-format=json", "--color=never"]);
+    let output = run(cmd)?;
+    Ok(check_outcome(&output))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CheckOutcome {
+    Passed,
+    Failed(Vec<String>),
+}
+
+fn check_outcome(output: &Output) -> CheckOutcome {
+    let mut errors = Vec::new();
+    for line in output.stdout.lines() {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if msg["reason"] != "compiler-message" || msg["message"]["level"] != "error" {
+            continue;
+        }
+        // Only errors with spans: a linker error or build script
+        // failure lands on stderr instead.
+        if msg["message"]["spans"].as_array().is_some_and(|s| !s.is_empty()) {
+            errors.push(msg["message"]["rendered"].as_str().unwrap_or_default().trim_end().to_string());
+        }
+    }
+    if !errors.is_empty() {
+        return CheckOutcome::Failed(errors);
+    }
+    if !output.stderr.contains("Finished") && output.stderr.contains("error") {
+        return CheckOutcome::Failed(vec![tail(&output.stderr, 40)]);
+    }
+    CheckOutcome::Passed
+}
+
 /// Which crate target a source file is compiled in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
